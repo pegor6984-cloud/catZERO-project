@@ -97,3 +97,5 @@ Reset
 Reboot
 
 That's all for now, now I'll sit and improve my code!!
+
+Guys, I was afraid of hate and that's why I renamed my project to catZero!!!
