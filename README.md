@@ -4,53 +4,85 @@ Hello my name is Egor I'm 13 I live in Ukraine I created my new catHACK project 
 Connection
 
 oled(128x64):
+
 gnd-gnd
+
 vcc-5v
+
 scl-9D
+
 sda-8D
 
 butons:
+
 up/left-20D
+
 ok-0D
+
 down/Right-1D
 
 nrf24:
+
 CE-3D
+
 CSN-4D
+
 MOSI-7D
+
 SCK-6D
+
 MISO-2D
 
 Ir capture/transmit:
+
 capture:
+
 gnd-gnd
+
 vcc-vcc
+
 s-5D
+
 transmit:
+
 gnd-gnd
+
 vcc-21D
 
 CatHACK Features:
 
 WIFI:
+
 Scan
+
 spectrum
 
 nRF24:
+
 Spectrum
+
 jammer
+
 Recheck
 
 IR:
+
 capture
+
 transmit
+
 Erase All
+
 TV-B-Gone
 
 Settings:
+
 info
+
 Timeout
+
 Reset
+
 Reboot
 
 That's all for now, now I'll sit and improve my code!!
