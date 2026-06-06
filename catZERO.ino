@@ -1,8 +1,7 @@
 /*
  * =====================================================================
- *  catHACK v4.3 – Полностью развёрнутая стабильная версия
- *  Без GyverOLED, только Adafruit_SSD1306 и Adafruit_GFX
- *  ESP32-C3 | OLED (SDA=8, SCL=9) | Кнопки (UP=20, DOWN=1, OK=0)
+ *  catZERO v1.0 – Переименованный проект с новой заставкой
+ *  ESP32-C3 | OLED (SDA=8, SCL=9) | Кнопки (UP=20, DOWN=1, OK=0, RESET=10)
  *  IR LED на GPIO21, IR приёмник на GPIO5, nRF24, TV-B-Gone, сохранение
  * =====================================================================
  */
@@ -32,6 +31,7 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 #define BTN_UP           20
 #define BTN_DOWN         1
 #define BTN_OK           0
+#define BTN_RESET        10     // кнопка перезагрузки
 
 #define RF_CE_PIN        3
 #define RF_CSN_PIN       4
@@ -204,6 +204,47 @@ bool longPressDetected = false;
 
 uint8_t tvbgone_region = 0;  // 0=NA, 1=EU
 
+// ========================== НОВАЯ ЗАСТАВКА ==========================
+const char* bootLogo[] =
+{
+  " ####   ##   #####",
+  "##  ## ####    ## ",
+  "##    ##  ##   ## ",
+  "##  ########   ## ",
+  " ######    ##  ## "
+};
+
+void showBootLogo()
+{
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  // рисуем построчно с анимацией
+  for (int i = 0; i < 5; i++)
+  {
+    display.setCursor(5, 5 + i * 8);
+    display.println(bootLogo[i]);
+    display.display();
+    delay(120);
+  }
+
+  // надпись ZERO внизу
+  display.setCursor(42, 52);
+  display.println("ZERO");
+  display.display();
+  delay(1000);
+
+  // чистим и показываем чистое название
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(15, 25);
+  display.println("catZERO");
+  display.display();
+  delay(1000);
+  display.setTextSize(1);
+}
+
 // ========================== ПРОТОТИПЫ ФУНКЦИЙ ==========================
 void setup();
 void loop();
@@ -259,7 +300,10 @@ void setup()
   deviceBootTime = millis();
   lastActivityTime = millis();
   Serial.begin(115200);
-  Serial.println("\ncatHACK v4.3 Starting");
+  Serial.println("\ncatZERO v1.0 Starting");
+
+  // Кнопка сброса
+  pinMode(BTN_RESET, INPUT_PULLUP);
 
   loadTimeout();
 
@@ -269,15 +313,9 @@ void setup()
     for (;;);
   }
   display.clearDisplay();
-  display.setTextSize(2);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(20, 20);
-  display.println("catHACK");
-  display.setTextSize(1);
-  display.setCursor(45, 45);
-  display.println("v4.3");
-  display.display();
-  delay(1500);
+
+  // Новая заставка
+  showBootLogo();
 
   pinMode(BTN_UP, INPUT_PULLUP);
   pinMode(BTN_DOWN, INPUT_PULLUP);
@@ -315,7 +353,7 @@ void setup()
   {
     irSlots[i].isValid = false;
   }
-  loadIrSlots();   // загружаем сохранённые IR сигналы
+  loadIrSlots();
 
   WiFi.mode(WIFI_MODE_NULL);
   esp_wifi_start();
@@ -371,7 +409,7 @@ void showMsg(const char* msg)
 void saveIrSlots()
 {
   EEPROM.begin(EEPROM_SIZE_BYTES);
-  int address = 100;  // используем область EEPROM начиная с адреса 100
+  int address = 100;
   for (int i = 0; i < IR_SLOTS_COUNT; i++)
   {
     EEPROM.write(address++, irSlots[i].isValid ? 1 : 0);
@@ -473,7 +511,6 @@ void tvbgone_send_all(const IrCode* const* codes, uint8_t num_codes)
       pCnt++;
     }
 
-    // Передача сигнала
     for (uint16_t i = 0; i < pCnt; i += 2)
     {
       ledcWrite(0, 128);
@@ -483,7 +520,6 @@ void tvbgone_send_all(const IrCode* const* codes, uint8_t num_codes)
       yield();
     }
 
-    // Обновление прогресса (1% в секунду)
     unsigned long now = millis();
     if (now >= nextProgressTime)
     {
@@ -528,7 +564,6 @@ void tvbgone_menu()
     }
     if (ok)
     {
-      // сохраним регион в EEPROM (ячейка 1)
       EEPROM.begin(EEPROM_SIZE_BYTES);
       EEPROM.write(1, tvbgone_region);
       EEPROM.commit();
@@ -563,7 +598,6 @@ void processIrCapture()
   {
     tempRawLen = irResult.rawlen;
     if (tempRawLen > IR_BUFFER_SIZE) tempRawLen = IR_BUFFER_SIZE;
-    // Переводим тики библиотеки (обычно 50 мкс) в микросекунды
     for (int i = 0; i < tempRawLen; i++)
     {
       tempRaw[i] = irResult.rawbuf[i] * 50;
@@ -824,7 +858,7 @@ void drawItem(const char* text, bool sel, int line)
 void drawMainMenu()
 {
   display.clearDisplay();
-  drawHeader("catHACK");
+  drawHeader("catZERO");
   const char* items[] = {"WiFi", "nRF24", "IR", "Settings"};
   for (int i = 0; i < MAIN_SIZE; i++)
   {
@@ -1330,6 +1364,16 @@ void loop()
   bool down = btnDown();
   bool ok = btnOk() && !longPressDetected;
 
+  // Кнопка сброса на GPIO10
+  if (digitalRead(BTN_RESET) == LOW)
+  {
+    delay(50);
+    if (digitalRead(BTN_RESET) == LOW)
+    {
+      ESP.restart();
+    }
+  }
+
   if (!displayOn && (up || down || ok))
   {
     setPower(true);
@@ -1346,7 +1390,7 @@ void loop()
     needRedraw = true;
   }
 
-  // Обработка UP
+  // UP
   if (up)
   {
     switch (appState)
@@ -1419,7 +1463,7 @@ void loop()
     delay(150);
   }
 
-  // Обработка DOWN
+  // DOWN
   if (down)
   {
     switch (appState)
@@ -1486,7 +1530,7 @@ void loop()
     delay(150);
   }
 
-  // Обработка OK (короткое нажатие)
+  // OK
   if (ok)
   {
     switch (appState)
