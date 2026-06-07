@@ -1,9 +1,9 @@
 /*
- * =====================================================================
- *  catZERO v1.0 – Переименованный проект с новой заставкой
- *  ESP32-C3 | OLED (SDA=8, SCL=9) | Кнопки (UP=20, DOWN=1, OK=0, RESET=10)
- *  IR LED на GPIO21, IR приёмник на GPIO5, nRF24, TV-B-Gone, сохранение
- * =====================================================================
+ * ============================================================================
+ * catZERO v2.1 – Аналоговые кнопки (GPIO0) – ИСПРАВЛЕНО
+ * Все кнопки (UP/DOWN/OK) подключены к одному пину 0 через резисторы.
+ * SD-карта: CS=20, SPI: MOSI=7, MISO=2, SCK=6 (общие с nRF24)
+ * ============================================================================
  */
 
 #include <EEPROM.h>
@@ -19,30 +19,45 @@
 #include <esp_wifi.h>
 #include <esp_wifi_types.h>
 #include <vector>
+#include <SD.h>
 
-// ========================== ПИНЫ ==========================
-#define OLED_SDA         8
-#define OLED_SCL         9
-#define SCREEN_WIDTH     128
-#define SCREEN_HEIGHT    64
-#define OLED_ADDR        0x3C
+// -------------------------- НАСТРОЙКИ --------------------------
+#define CMD_INFO    "info"
+#define CMD_DEV     "def"
+#define CMD_CLEAR   "clear"
+#define CMD_CS      "ch"
+#define CMD_SFV     "ch w"
+#define CMD_EXIT    "exit"
+#define CMD_AP      "ap"
+
+#define COMMAND_TIMEOUT_CS      -1
+#define COMMAND_TIMEOUT_SFV     -1
+#define DEV_MODE_TIMEOUT        -1
+#define CONSOLE_AUTOREPEAT_DELAY  150
+#define ADMIN_PASSWORD "admin"
+
+// -------------------------- ПИНЫ --------------------------
+#define BTN_ANALOG_PIN  0         // Аналоговая кнопка
+
+#define SD_CS_PIN       20        // CS для SD (GPIO20)
+#define SPI_MOSI        7
+#define SPI_MISO        2
+#define SPI_SCK         6
+
+#define RF_CE_PIN       3
+#define RF_CSN_PIN      4
+
+#define IR_RX_PIN       5
+#define IR_TX_PIN       21
+
+#define OLED_SDA        8
+#define OLED_SCL        9
+#define SCREEN_WIDTH    128
+#define SCREEN_HEIGHT   64
+#define OLED_ADDR       0x3C
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-#define BTN_UP           20
-#define BTN_DOWN         1
-#define BTN_OK           0
-#define BTN_RESET        10     // кнопка перезагрузки
-
-#define RF_CE_PIN        3
-#define RF_CSN_PIN       4
-#define RF_MOSI_PIN      7
-#define RF_SCK_PIN       6
-#define RF_MISO_PIN      2
-
-#define IR_RX_PIN        5
-#define IR_TX_PIN        21
-
-// ========================== КОНСТАНТЫ ==========================
+// -------------------------- КОНСТАНТЫ --------------------------
 #define NRF_CHANNELS        80
 #define WIFI_CHANNELS       14
 #define IR_SLOTS_COUNT      4
@@ -53,7 +68,28 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 #define TVBGONE_CARRIER_HZ  38000
 #define TVBGONE_CODE_GAP    200
 
-// ========================== ЧАСТОТЫ ДЛЯ ГЛУШЕНИЯ ==========================
+// -------------------------- КНОПКИ (ВАШ ТЕСТОВЫЙ КОД) --------------------------
+enum Button {
+  BTN_NONE,
+  BTN_UP,
+  BTN_DOWN,
+  BTN_OK
+};
+
+Button readButton() {
+  int value = analogRead(BTN_ANALOG_PIN);
+  if (value > 3800) return BTN_NONE;
+  if (value > 2700 && value < 3400) return BTN_UP;
+  if (value > 2000 && value < 2600) return BTN_OK;
+  if (value > 1500 && value < 1950) return BTN_DOWN;
+  return BTN_NONE;
+}
+
+bool btnUp()   { return readButton() == BTN_UP; }
+bool btnDown() { return readButton() == BTN_DOWN; }
+bool btnOk()   { return readButton() == BTN_OK; }
+
+// -------------------------- ЧАСТОТЫ ДЛЯ ГЛУШЕНИЯ --------------------------
 const byte BLUETOOTH_CHANNELS[] = {
   0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,
   20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,
@@ -69,7 +105,7 @@ const byte BLE_CHANNELS[] = {
 };
 const int BLE_CHANNELS_COUNT = 40;
 
-// ========================== СТРУКТУРЫ ==========================
+// -------------------------- СТРУКТУРЫ --------------------------
 struct WiFiNetworkInfo
 {
   String ssid;
@@ -88,7 +124,6 @@ struct IrSignalData
   bool isValid;
 };
 
-// ========================== TV-B-Gone КОДЫ (УПРОЩЁННЫЕ) ==========================
 struct IrCode
 {
   uint8_t freq;
@@ -98,6 +133,7 @@ struct IrCode
   const uint8_t *codes;
 };
 
+// -------------------------- TV-B-Gone КОДЫ (ПРИМЕР) --------------------------
 const uint16_t sony_times[] = {240, 600, 1200, 600};
 const uint8_t sony_codes[] = {0x01, 0x00, 0x00, 0x00};
 const IrCode sony_code = {0x13, 2, 2, sony_times, sony_codes};
@@ -107,7 +143,7 @@ const IrCode* const EUpowerCodes[] = {&sony_code};
 const uint8_t num_NAcodes = 1;
 const uint8_t num_EUcodes = 1;
 
-// ========================== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ==========================
+// -------------------------- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ --------------------------
 int displayTimeoutSec = 30;
 unsigned long lastActivityTime = 0;
 bool displayOn = true;
@@ -180,7 +216,9 @@ enum AppState
   STATE_SYSTEM_INFO,
   STATE_TIMEOUT,
   STATE_RESET_CONFIRM,
-  STATE_REBOOT_CONFIRM
+  STATE_REBOOT_CONFIRM,
+  STATE_CONSOLE,
+  STATE_CONSOLE_COMMAND_OUTPUT
 };
 AppState appState = STATE_MAIN_MENU;
 
@@ -192,7 +230,7 @@ int settingsIdx = 0;
 int wifiActionIdx = 0;
 int timeoutVal = 30;
 
-const int MAIN_SIZE = 4;
+const int MAIN_SIZE = 5;
 const int WIFI_MENU_SIZE = 3;
 const int NRF_MENU_SIZE = 4;
 const int IR_MENU_SIZE = 5;
@@ -202,50 +240,92 @@ const int WIFI_ACTIONS_SIZE = 4;
 unsigned long okPressStart = 0;
 bool longPressDetected = false;
 
-uint8_t tvbgone_region = 0;  // 0=NA, 1=EU
+uint8_t tvbgone_region = 0;
 
-// ========================== НОВАЯ ЗАСТАВКА ==========================
-const char* bootLogo[] =
-{
-  " ####   ##   #####",
-  "##  ## ####    ## ",
-  "##    ##  ##   ## ",
-  "##  ########   ## ",
-  " ######    ##  ## "
+// -------------------------- ПЕРЕМЕННЫЕ КОНСОЛИ И АДМИНКИ --------------------------
+enum ConsoleMode { CONSOLE_KEYBOARD, CONSOLE_INFO, CONSOLE_DEV };
+ConsoleMode consoleMode = CONSOLE_KEYBOARD;
+
+bool capsLock = false;
+String consoleText = "";
+
+String lowerKeys[] = {
+  "a","b","c","d","e","f","g","h",
+  "i","j","k","l","m","n","o","p",
+  "q","r","s","t","u","v","w","x",
+  "y","z","1","2","3","4","5","6",
+  "7","8","9","Space","Caps","Del","OK","Exit"
 };
 
-void showBootLogo()
-{
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
+String upperKeys[] = {
+  "A","B","C","D","E","F","G","H",
+  "I","J","K","L","M","N","O","P",
+  "Q","R","S","T","U","V","W","X",
+  "Y","Z","!","@","#","$","%","&",
+  "*","(",")","Space","Caps","Del","OK","Exit"
+};
 
-  // рисуем построчно с анимацией
-  for (int i = 0; i < 5; i++)
-  {
-    display.setCursor(5, 5 + i * 8);
-    display.println(bootLogo[i]);
+int selectedKey = 0;
+const int totalKeys = 40;
+
+String infoLines[] = {
+  "CPU: ESP32-C3",
+  "Flash:" + String(ESP.getFlashChipSize() / 1024 / 1024) + "MB",
+  "Heap:" + String(ESP.getFreeHeap() / 1024) + "KB",
+  "Chip Rev:" + String(ESP.getChipRevision()),
+  "Freq:" + String(ESP.getCpuFreqMHz()) + "MHz",
+  "Uptime:" + String(millis() / 1000) + "s"
+};
+int infoPage = 0;
+const int totalInfo = 6;
+
+int secretCode[] = {1,2,3, 1,2,3, 1,2,3};
+int enteredCode[9];
+int codePos = 0;
+
+String commandOutput = "";
+unsigned long commandStartTime = 0;
+int commandTimeoutSec = 0;
+bool waitingForOk = false;
+
+bool adminMode = false;
+String adminPassword = ADMIN_PASSWORD;
+int displayBrightness = 128;
+bool displayInvert = false;
+int irBufferSize = 512;
+
+// -------------------------- SD-КАРТА --------------------------
+void initSDCard() {
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SD_CS_PIN);
+  if (!SD.begin(SD_CS_PIN)) {
+    display.clearDisplay();
+    display.setCursor(10, 28);
+    display.println("SD Card failed!");
     display.display();
-    delay(120);
+    delay(2000);
+    return;
   }
-
-  // надпись ZERO внизу
-  display.setCursor(42, 52);
-  display.println("ZERO");
-  display.display();
-  delay(1000);
-
-  // чистим и показываем чистое название
+  uint8_t cardType = SD.cardType();
+  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+  uint64_t freeSpace = (SD.totalBytes() - SD.usedBytes()) / (1024 * 1024);
   display.clearDisplay();
-  display.setTextSize(2);
-  display.setCursor(15, 25);
-  display.println("catZERO");
+  display.setCursor(10, 10);
+  display.println("SD Card OK");
+  display.setCursor(10, 25);
+  display.print("Type: ");
+  if (cardType == CARD_MMC) display.print("MMC");
+  else if (cardType == CARD_SD) display.print("SDSC");
+  else if (cardType == CARD_SDHC) display.print("SDHC");
+  else display.print("Unknown");
+  display.setCursor(10, 40);
+  display.print("Size: "); display.print(cardSize); display.println(" MB");
+  display.setCursor(10, 55);
+  display.print("Free: "); display.print(freeSpace); display.println(" MB");
   display.display();
-  delay(1000);
-  display.setTextSize(1);
+  delay(3000);
 }
 
-// ========================== ПРОТОТИПЫ ФУНКЦИЙ ==========================
+// -------------------------- ПРОТОТИПЫ --------------------------
 void setup();
 void loop();
 void updateDisplay();
@@ -289,85 +369,56 @@ void drawTimeoutMenu();
 void drawResetConfirm();
 void drawRebootConfirm();
 
-bool btnUp()   { return digitalRead(BTN_UP) == LOW; }
-bool btnDown() { return digitalRead(BTN_DOWN) == LOW; }
-bool btnOk()   { return digitalRead(BTN_OK) == LOW; }
+void consoleLoop();
+void drawKeyboard();
+void executeCommand(String cmd);
+void consoleInfoMode();
+void consoleDevMode();
+void showCommandOutput(String output, int timeoutSeconds);
+void adminPanel();
+void changePins();
+void setBrightness();
+void setInvert();
+void showProcesses();
+void reinitHardware();
+String inputStringWithKeyboard(bool allowExit, const char* title);
+int editPinValue(const char* prompt);
+void drawAdminMenuHighlight(int sel);
 
-// ========================== ОСНОВНЫЕ ФУНКЦИИ ==========================
-void setup()
+// -------------------------- ЗАСТАВКА --------------------------
+const char* bootLogo[] =
 {
-  delay(500);
-  deviceBootTime = millis();
-  lastActivityTime = millis();
-  Serial.begin(115200);
-  Serial.println("\ncatZERO v1.0 Starting");
+  " ####   ##   #####",
+  "##  ## ####    ## ",
+  "##    ##  ##   ## ",
+  "##  ########   ## ",
+  " ######    ##  ## "
+};
 
-  // Кнопка сброса
-  pinMode(BTN_RESET, INPUT_PULLUP);
-
-  loadTimeout();
-
-  Wire.begin(OLED_SDA, OLED_SCL);
-  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR))
-  {
-    for (;;);
-  }
+void showBootLogo()
+{
   display.clearDisplay();
-
-  // Новая заставка
-  showBootLogo();
-
-  pinMode(BTN_UP, INPUT_PULLUP);
-  pinMode(BTN_DOWN, INPUT_PULLUP);
-  pinMode(BTN_OK, INPUT_PULLUP);
-  pinMode(IR_TX_PIN, OUTPUT);
-  digitalWrite(IR_TX_PIN, LOW);
-
-  // nRF24
-  SPI.begin(RF_SCK_PIN, RF_MISO_PIN, RF_MOSI_PIN, RF_CSN_PIN);
-  SPI.setFrequency(8000000);
-  if (radio.begin(RF_CE_PIN, RF_CSN_PIN) && radio.isChipConnected())
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  for (int i = 0; i < 5; i++)
   {
-    nrfOk = true;
-    nrfErrorMsg = "OK";
-    radio.setChannel(42);
-    radio.setPALevel(RF24_PA_MAX, true);
-    radio.setAutoAck(false);
-    radio.disableCRC();
-    radio.stopListening();
-    Serial.println("nRF24 OK");
+    display.setCursor(5, 5 + i * 8);
+    display.println(bootLogo[i]);
+    display.display();
+    delay(120);
   }
-  else
-  {
-    nrfOk = false;
-    nrfErrorMsg = "not found";
-    Serial.println("nRF24 FAIL");
-  }
-
-  irRx = new IRrecv(IR_RX_PIN);
-  irRx->enableIRIn();
-  irRxOk = true;
-  irTx = new IRsend(IR_TX_PIN);
-  irTx->begin();
-  for (int i = 0; i < IR_SLOTS_COUNT; i++)
-  {
-    irSlots[i].isValid = false;
-  }
-  loadIrSlots();
-
-  WiFi.mode(WIFI_MODE_NULL);
-  esp_wifi_start();
-  delay(50);
-
-  memset(nrfSmooth, 0, sizeof(nrfSmooth));
-  memset(wifiSmooth, 0, sizeof(wifiSmooth));
-
-  appState = STATE_MAIN_MENU;
-  needRedraw = true;
-  Serial.println("Setup complete");
+  display.setCursor(42, 52);
+  display.println("ZERO");
+  display.display();
+  delay(1000);
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(15, 25);
+  display.println("catZERO");
+  display.display();
+  delay(1000);
+  display.setTextSize(1);
 }
-
-// ========================== НАСТРОЙКИ ==========================
 void saveTimeout()
 {
   EEPROM.begin(EEPROM_SIZE_BYTES);
@@ -379,24 +430,15 @@ void loadTimeout()
 {
   EEPROM.begin(EEPROM_SIZE_BYTES);
   displayTimeoutSec = EEPROM.read(0);
-  if (displayTimeoutSec == 255 || displayTimeoutSec == 0)
-  {
-    displayTimeoutSec = 30;
-  }
+  if (displayTimeoutSec == 255 || displayTimeoutSec == 0) displayTimeoutSec = 30;
   EEPROM.end();
 }
 void setPower(bool on)
 {
   if (on == displayOn) return;
   displayOn = on;
-  if (on)
-  {
-    display.ssd1306_command(SSD1306_DISPLAYON);
-  }
-  else
-  {
-    display.ssd1306_command(SSD1306_DISPLAYOFF);
-  }
+  if (on) display.ssd1306_command(SSD1306_DISPLAYON);
+  else display.ssd1306_command(SSD1306_DISPLAYOFF);
 }
 void showMsg(const char* msg)
 {
@@ -405,7 +447,7 @@ void showMsg(const char* msg)
   needRedraw = true;
 }
 
-// ========================== IR СЛОТЫ (СОХРАНЕНИЕ В EEPROM) ==========================
+// -------------------------- IR СЛОТЫ --------------------------
 void saveIrSlots()
 {
   EEPROM.begin(EEPROM_SIZE_BYTES);
@@ -444,21 +486,17 @@ void loadIrSlots()
 }
 void eraseAllIrSlots()
 {
-  for (int i = 0; i < IR_SLOTS_COUNT; i++)
-  {
-    irSlots[i].isValid = false;
-  }
+  for (int i = 0; i < IR_SLOTS_COUNT; i++) irSlots[i].isValid = false;
   saveIrSlots();
   showMsg("All IR slots erased");
 }
 
-// ========================== TV-B-Gone ФУНКЦИИ ==========================
+// -------------------------- TV-B-Gone --------------------------
 void tvbgone_send_all(const IrCode* const* codes, uint8_t num_codes)
 {
   ledcSetup(0, TVBGONE_CARRIER_HZ, 8);
   ledcAttachPin(IR_TX_PIN, 0);
   ledcWrite(0, 0);
-
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
@@ -466,16 +504,12 @@ void tvbgone_send_all(const IrCode* const* codes, uint8_t num_codes)
   display.print("Sending IR codes...");
   display.setCursor(10, 25);
   display.print("Region: ");
-  if (tvbgone_region == 0)
-    display.print("NA");
-  else
-    display.print("EU");
+  if (tvbgone_region == 0) display.print("NA");
+  else display.print("EU");
   display.drawRect(10, 45, 108, 8, SSD1306_WHITE);
   display.display();
-
   unsigned long startTime = millis();
   unsigned long nextProgressTime = startTime + 1000;
-
   for (uint8_t idx = 0; idx < num_codes; idx++)
   {
     const IrCode* code = codes[idx];
@@ -483,12 +517,9 @@ void tvbgone_send_all(const IrCode* const* codes, uint8_t num_codes)
     uint8_t bitComp = code->comp;
     const uint16_t* timePtr = code->times;
     const uint8_t* codePtr = code->codes;
-
     uint16_t pairs[256];
     uint16_t pCnt = 0;
-    uint8_t bits = 0;
-    uint8_t bitsLeft = 0;
-
+    uint8_t bits = 0, bitsLeft = 0;
     for (uint8_t k = 0; k < numPairs; k++)
     {
       uint8_t idxTime = 0;
@@ -496,8 +527,7 @@ void tvbgone_send_all(const IrCode* const* codes, uint8_t num_codes)
       {
         if (bitsLeft == 0)
         {
-          bits = *codePtr;
-          codePtr++;
+          bits = *codePtr++;
           bitsLeft = 8;
         }
         bitsLeft--;
@@ -505,12 +535,9 @@ void tvbgone_send_all(const IrCode* const* codes, uint8_t num_codes)
       }
       uint16_t onTime = timePtr[idxTime * 4];
       uint16_t offTime = timePtr[idxTime * 4 + 2];
-      pairs[pCnt] = onTime;
-      pCnt++;
-      pairs[pCnt] = offTime;
-      pCnt++;
+      pairs[pCnt++] = onTime;
+      pairs[pCnt++] = offTime;
     }
-
     for (uint16_t i = 0; i < pCnt; i += 2)
     {
       ledcWrite(0, 128);
@@ -519,7 +546,6 @@ void tvbgone_send_all(const IrCode* const* codes, uint8_t num_codes)
       delayMicroseconds(pairs[i + 1] * 10);
       yield();
     }
-
     unsigned long now = millis();
     if (now >= nextProgressTime)
     {
@@ -534,20 +560,16 @@ void tvbgone_send_all(const IrCode* const* codes, uint8_t num_codes)
       display.display();
       nextProgressTime = now + 1000;
     }
-
     delay(TVBGONE_CODE_GAP);
   }
-
   display.fillRect(11, 46, 108, 6, SSD1306_WHITE);
   display.setCursor(55, 35);
   display.print("100%");
   display.display();
-
   ledcDetachPin(IR_TX_PIN);
   ledcWrite(0, 0);
   showMsg("Done");
 }
-
 void tvbgone_menu()
 {
   tvbgone_region = 0;
@@ -568,14 +590,8 @@ void tvbgone_menu()
       EEPROM.write(1, tvbgone_region);
       EEPROM.commit();
       EEPROM.end();
-      if (tvbgone_region == 0)
-      {
-        tvbgone_send_all(NApowerCodes, num_NAcodes);
-      }
-      else
-      {
-        tvbgone_send_all(EUpowerCodes, num_EUcodes);
-      }
+      if (tvbgone_region == 0) tvbgone_send_all(NApowerCodes, num_NAcodes);
+      else tvbgone_send_all(EUpowerCodes, num_EUcodes);
       showMsg("Done!");
       break;
     }
@@ -585,7 +601,7 @@ void tvbgone_menu()
   needRedraw = true;
 }
 
-// ========================== ЛОГИЧЕСКИЕ ФУНКЦИИ ==========================
+// -------------------------- ЛОГИЧЕСКИЕ ФУНКЦИИ (WiFi, nRF24, IR) --------------------------
 void processIrCapture()
 {
   if (millis() > irTimeout)
@@ -598,17 +614,13 @@ void processIrCapture()
   {
     tempRawLen = irResult.rawlen;
     if (tempRawLen > IR_BUFFER_SIZE) tempRawLen = IR_BUFFER_SIZE;
-    for (int i = 0; i < tempRawLen; i++)
-    {
-      tempRaw[i] = irResult.rawbuf[i] * 50;
-    }
+    for (int i = 0; i < tempRawLen; i++) tempRaw[i] = irResult.rawbuf[i] * 50;
     tempProto = String(typeToString(irResult.decode_type, irResult.repeat));
     irTempReady = true;
     irRx->resume();
     needRedraw = true;
   }
 }
-
 void sendIr(int slot)
 {
   if (!irSlots[slot].isValid) return;
@@ -618,10 +630,9 @@ void sendIr(int slot)
     delay(50);
   }
 }
-
 void recheckNRF24()
 {
-  SPI.begin(RF_SCK_PIN, RF_MISO_PIN, RF_MOSI_PIN, RF_CSN_PIN);
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, RF_CSN_PIN);
   SPI.setFrequency(8000000);
   if (radio.begin(RF_CE_PIN, RF_CSN_PIN) && radio.isChipConnected())
   {
@@ -642,7 +653,6 @@ void recheckNRF24()
   }
   needRedraw = true;
 }
-
 void startWifiScan()
 {
   wifiScanning = true;
@@ -650,6 +660,21 @@ void startWifiScan()
   wifiSelectedIdx = 0;
   wifiScrollOffset = 0;
   needRedraw = true;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(20, 30);
+  display.print("Loading");
+  display.display();
+  for (int i = 0; i < 12; i++)
+  {
+    int dots = (i % 4);
+    display.fillRect(70, 30, 30, 8, BLACK);
+    display.setCursor(70, 30);
+    for (int d = 0; d < dots; d++) display.print(".");
+    display.display();
+    delay(250);
+  }
   int found = WiFi.scanNetworks();
   for (int i = 0; i < found && i < 50; i++)
   {
@@ -672,13 +697,10 @@ void startWifiScan()
     wifiList.push_back(net);
   }
   wifiScanning = false;
-  if (wifiList.empty())
-    wifiSelectedIdx = -1;
-  else
-    wifiSelectedIdx = 0;
+  if (wifiList.empty()) wifiSelectedIdx = -1;
+  else wifiSelectedIdx = 0;
   needRedraw = true;
 }
-
 void updateWifiSpectrum()
 {
   if (!wifiSpectrumActive) return;
@@ -691,30 +713,23 @@ void updateWifiSpectrum()
     needRedraw = true;
   }
   for (int ch = 1; ch <= WIFI_CHANNELS; ch++)
-  {
     wifiSmooth[ch] = (wifiSmooth[ch] * 7 + wifiPackets[ch] * 3) / 10;
-  }
 }
-
 void sendDeauth()
 {
   WiFi.mode(WIFI_STA);
   esp_wifi_set_channel(targetChan, WIFI_SECOND_CHAN_NONE);
   uint8_t deauth[26] = {
-    0xC0, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    targetBSSID[0], targetBSSID[1], targetBSSID[2], targetBSSID[3], targetBSSID[4], targetBSSID[5],
-    targetBSSID[0], targetBSSID[1], targetBSSID[2], targetBSSID[3], targetBSSID[4], targetBSSID[5],
-    0x00, 0x00, 0x07, 0x00
+    0xC0,0x00,0x00,0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    targetBSSID[0],targetBSSID[1],targetBSSID[2],targetBSSID[3],targetBSSID[4],targetBSSID[5],
+    targetBSSID[0],targetBSSID[1],targetBSSID[2],targetBSSID[3],targetBSSID[4],targetBSSID[5],
+    0x00,0x00,0x07,0x00
   };
   uint8_t mac[6];
   esp_read_mac(mac, ESP_MAC_WIFI_STA);
-  for (int i = 0; i < 6; i++)
-  {
-    deauth[10 + i] = mac[i];
-  }
+  for (int i = 0; i < 6; i++) deauth[10 + i] = mac[i];
   esp_wifi_80211_tx(WIFI_IF_STA, deauth, sizeof(deauth), false);
 }
-
 void updateNrfSpectrum()
 {
   if (!nrfOk) return;
@@ -753,36 +768,19 @@ void updateNrfSpectrum()
   for (int i = 0; i < 5; i++)
   {
     int idx = (currentNrfChan - i + NRF_CHANNELS) % NRF_CHANNELS;
-    if (nrfRaw[idx] > 0 || i == 0)
-    {
-      recent[cnt++] = nrfRaw[idx];
-    }
+    if (nrfRaw[idx] > 0 || i == 0) recent[cnt++] = nrfRaw[idx];
   }
   for (int i = 0; i < cnt - 1; i++)
-  {
     for (int j = i + 1; j < cnt; j++)
-    {
-      if (recent[i] > recent[j])
-      {
-        int t = recent[i];
-        recent[i] = recent[j];
-        recent[j] = t;
-      }
-    }
-  }
+      if (recent[i] > recent[j]) { int t = recent[i]; recent[i] = recent[j]; recent[j] = t; }
   int filtered = recent[cnt / 2];
   nrfSmooth[currentNrfChan] = (nrfSmooth[currentNrfChan] * 7 + filtered * 3) / 10;
   currentNrfChan = (currentNrfChan + 1) % NRF_CHANNELS;
   needRedraw = true;
 }
-
 void startJammer()
 {
-  if (!nrfOk)
-  {
-    showMsg(nrfErrorMsg.c_str());
-    return;
-  }
+  if (!nrfOk) { showMsg(nrfErrorMsg.c_str()); return; }
   jamming = true;
   lastJamTime = millis();
   radio.powerUp();
@@ -791,19 +789,15 @@ void startJammer()
   radio.setDataRate(RF24_2MBPS);
   radio.setAutoAck(false);
   radio.disableCRC();
-  if (jammerMode == BLE_JAMMER_MODE)
-    showMsg("BLE Jammer ON");
-  else
-    showMsg("BT Jammer ON");
+  if (jammerMode == BLE_JAMMER_MODE) showMsg("BLE Jammer ON");
+  else showMsg("BT Jammer ON");
 }
-
 void stopJammer()
 {
   jamming = false;
   radio.powerDown();
   showMsg("Jammer OFF");
 }
-
 void updateJammer()
 {
   if (!jamming) return;
@@ -826,7 +820,19 @@ void updateJammer()
   }
 }
 
-// ========================== ОТРИСОВКА МЕНЮ ==========================
+// -------------------------- ОТРИСОВКА МЕНЮ (ТОЛЬКО ЗАГОЛОВКИ, ПОЛНЫЙ КОД ДАЛЕЕ) --------------------------
+// Здесь должны быть все функции draw... (они не изменились, я их опускаю для краткости,
+// но в вашем полном коде они есть. Во второй части они будут полностью.
+// Пожалуйста, убедитесь, что у вас есть все функции отрисовки из предыдущей версии.
+// Для экономии места я не повторяю их здесь, но при необходимости я добавлю их во вторую часть.
+
+// ========================== КОНЕЦ ПЕРВОЙ ЧАСТИ ==========================
+// Теперь вставьте вторую часть (функции консоли, админ-панели и основной цикл)
+// =====================================================================
+//  ВТОРАЯ ЧАСТЬ – отрисовка меню, консоль, админ-панель, основной цикл
+// =====================================================================
+
+// -------------------------- ОТРИСОВКА МЕНЮ --------------------------
 void drawHeader(const char* title)
 {
   display.fillRect(0, 0, SCREEN_WIDTH, 12, SSD1306_WHITE);
@@ -847,10 +853,7 @@ void drawItem(const char* text, bool sel, int line)
     display.setCursor(4, y);
     display.print(">");
   }
-  else
-  {
-    display.setTextColor(SSD1306_WHITE);
-  }
+  else display.setTextColor(SSD1306_WHITE);
   display.setCursor(14, y);
   display.print(text);
 }
@@ -859,11 +862,8 @@ void drawMainMenu()
 {
   display.clearDisplay();
   drawHeader("catZERO");
-  const char* items[] = {"WiFi", "nRF24", "IR", "Settings"};
-  for (int i = 0; i < MAIN_SIZE; i++)
-  {
-    drawItem(items[i], i == mainIdx, i);
-  }
+  const char* items[] = {"WiFi", "nRF24", "IR", "Console", "Settings"};
+  for (int i = 0; i < MAIN_SIZE; i++) drawItem(items[i], i == mainIdx, i);
   display.display();
 }
 
@@ -872,10 +872,7 @@ void drawWifiMenu()
   display.clearDisplay();
   drawHeader("WiFi");
   const char* items[] = {"Scan", "Spectrum", "Back"};
-  for (int i = 0; i < WIFI_MENU_SIZE; i++)
-  {
-    drawItem(items[i], i == wifiMenuIdx, i);
-  }
+  for (int i = 0; i < WIFI_MENU_SIZE; i++) drawItem(items[i], i == wifiMenuIdx, i);
   display.display();
 }
 
@@ -883,27 +880,15 @@ void drawWifiScan()
 {
   display.clearDisplay();
   drawHeader("WiFi Scan");
-  if (wifiScanning)
-  {
-    display.setCursor(40, 30);
-    display.println("Scanning...");
-  }
-  else if (wifiList.empty())
-  {
-    display.setCursor(30, 30);
-    display.println("No networks");
-  }
+  if (wifiScanning) display.setCursor(40,30), display.println("Scanning...");
+  else if (wifiList.empty()) display.setCursor(30,30), display.println("No networks");
   else
   {
     int visible = 4;
-    if (wifiSelectedIdx < wifiScrollOffset)
-      wifiScrollOffset = wifiSelectedIdx;
-    if (wifiSelectedIdx >= wifiScrollOffset + visible)
-      wifiScrollOffset = wifiSelectedIdx - visible + 1;
-    if (wifiScrollOffset < 0)
-      wifiScrollOffset = 0;
-    if (wifiScrollOffset + visible > (int)wifiList.size())
-      wifiScrollOffset = wifiList.size() - visible;
+    if (wifiSelectedIdx < wifiScrollOffset) wifiScrollOffset = wifiSelectedIdx;
+    if (wifiSelectedIdx >= wifiScrollOffset + visible) wifiScrollOffset = wifiSelectedIdx - visible + 1;
+    if (wifiScrollOffset < 0) wifiScrollOffset = 0;
+    if (wifiScrollOffset + visible > (int)wifiList.size()) wifiScrollOffset = wifiList.size() - visible;
     for (int i = 0; i < visible && wifiScrollOffset + i < (int)wifiList.size(); i++)
     {
       int idx = wifiScrollOffset + i;
@@ -915,12 +900,9 @@ void drawWifiScan()
         display.setCursor(2, y);
         display.print(">");
       }
-      else
-      {
-        display.setTextColor(SSD1306_WHITE);
-      }
+      else display.setTextColor(SSD1306_WHITE);
       display.setCursor(12, y);
-      String line = wifiList[idx].ssid.substring(0, 10) + " " + String(wifiList[idx].rssi);
+      String line = wifiList[idx].ssid.substring(0,10) + " " + String(wifiList[idx].rssi);
       display.print(line);
     }
     int yb = 14 + visible * 12;
@@ -931,10 +913,7 @@ void drawWifiScan()
       display.setCursor(2, yb);
       display.print(">");
     }
-    else
-    {
-      display.setTextColor(SSD1306_WHITE);
-    }
+    else display.setTextColor(SSD1306_WHITE);
     display.setCursor(12, yb);
     display.println("Back");
   }
@@ -946,325 +925,990 @@ void drawWifiSpectrum()
   display.clearDisplay();
   drawHeader("WiFi Spectrum");
   int maxV = 5;
-  for (int ch = 1; ch <= WIFI_CHANNELS; ch++)
-  {
-    if (wifiSmooth[ch] > maxV) maxV = wifiSmooth[ch];
-  }
+  for (int ch = 1; ch <= WIFI_CHANNELS; ch++) if (wifiSmooth[ch] > maxV) maxV = wifiSmooth[ch];
   if (maxV < 5) maxV = 5;
   for (int ch = 1; ch <= WIFI_CHANNELS; ch++)
   {
     int x = map(ch, 1, WIFI_CHANNELS, 2, SCREEN_WIDTH - 2);
     int h = map(wifiSmooth[ch], 0, maxV, 0, 35);
-    if (h > 0)
-    {
-      display.drawLine(x, 48 - h, x, 48, SSD1306_WHITE);
-    }
+    if (h > 0) display.drawLine(x, 48 - h, x, 48, SSD1306_WHITE);
   }
   display.drawLine(0, 48, SCREEN_WIDTH, 48, SSD1306_WHITE);
-  display.setCursor(2, 52);
-  display.printf("Ch:%d", currentWifiChan);
-  display.setCursor(70, 52);
-  display.printf("Pkt:%d", totalPackets);
+  display.setCursor(2,52); display.printf("Ch:%d", currentWifiChan);
+  display.setCursor(70,52); display.printf("Pkt:%d", totalPackets);
   display.display();
 }
 
 void drawWifiActions()
 {
-  display.clearDisplay();
-  drawHeader("Actions");
-  const char* acts[] = {"Info", "Deauth", "Stop", "Back"};
-  for (int i = 0; i < WIFI_ACTIONS_SIZE; i++)
-  {
-    drawItem(acts[i], i == wifiActionIdx, i);
-  }
-  if (deauthActive)
-  {
-    display.fillRect(0, 55, SCREEN_WIDTH, 9, SSD1306_WHITE);
-    display.setTextColor(SSD1306_BLACK);
-    display.setCursor(15, 56);
-    display.print("DEAUTH ON");
-  }
+  display.clearDisplay(); drawHeader("Actions");
+  const char* acts[] = {"Info","Deauth","Stop","Back"};
+  for (int i=0;i<WIFI_ACTIONS_SIZE;i++) drawItem(acts[i], i==wifiActionIdx, i);
+  if (deauthActive) { display.fillRect(0,55,SCREEN_WIDTH,9,WHITE); display.setTextColor(BLACK); display.setCursor(15,56); display.print("DEAUTH ON"); }
   display.display();
 }
 
 void drawWifiInfo()
 {
-  display.clearDisplay();
-  drawHeader("Net Info");
-  if (wifiSelectedIdx >= 0 && wifiSelectedIdx < (int)wifiList.size())
+  display.clearDisplay(); drawHeader("Net Info");
+  if (wifiSelectedIdx >=0 && wifiSelectedIdx < (int)wifiList.size())
   {
     WiFiNetworkInfo& n = wifiList[wifiSelectedIdx];
-    display.setCursor(2, 14);
-    display.printf("SSID: %s", n.ssid.substring(0, 13).c_str());
-    display.setCursor(2, 24);
-    display.printf("Ch: %d", n.channel);
-    display.setCursor(2, 34);
-    display.printf("RSSI: %d dBm", n.rssi);
-    display.setCursor(2, 44);
-    display.printf("Sec: %s", n.encryptionType.c_str());
+    display.setCursor(2,14); display.printf("SSID: %s", n.ssid.substring(0,13).c_str());
+    display.setCursor(2,24); display.printf("Ch: %d", n.channel);
+    display.setCursor(2,34); display.printf("RSSI: %d dBm", n.rssi);
+    display.setCursor(2,44); display.printf("Sec: %s", n.encryptionType.c_str());
   }
-  display.setCursor(2, 56);
-  display.print("Press=back");
+  display.setCursor(2,56); display.print("Press=back");
   display.display();
 }
 
 void drawNrfMenu()
 {
   display.clearDisplay();
-  char buf[30];
-  sprintf(buf, "nRF24 (%s)", nrfOk ? "OK" : nrfErrorMsg.c_str());
+  char buf[30]; sprintf(buf,"nRF24 (%s)", nrfOk?"OK":nrfErrorMsg.c_str());
   drawHeader(buf);
-  const char* items[] = {"Spectrum", "Jammer", "Recheck", "Back"};
-  for (int i = 0; i < NRF_MENU_SIZE; i++)
-  {
-    drawItem(items[i], i == nrfMenuIdx, i);
-  }
+  const char* items[] = {"Spectrum","Jammer","Recheck","Back"};
+  for (int i=0;i<NRF_MENU_SIZE;i++) drawItem(items[i], i==nrfMenuIdx, i);
   display.display();
 }
 
 void drawNrfSpectrum()
 {
-  display.clearDisplay();
-  drawHeader("nRF Spectrum");
-  if (!nrfOk)
+  display.clearDisplay(); drawHeader("nRF Spectrum");
+  if (!nrfOk) { display.setCursor(10,30); display.println("nRF24 not found!"); display.display(); return; }
+  int maxV=1; for(int i=0;i<NRF_CHANNELS;i++) if(nrfSmooth[i]>maxV) maxV=nrfSmooth[i];
+  if(maxV<3) maxV=3;
+  for(int x=0;x<SCREEN_WIDTH;x++)
   {
-    display.setCursor(10, 30);
-    display.println("nRF24 not found!");
-    display.display();
-    return;
+    int ch=map(x,0,SCREEN_WIDTH-1,0,NRF_CHANNELS-1);
+    int sig=nrfSmooth[ch]; if(sig<3) sig=0;
+    int h=map(sig,0,maxV,0,35);
+    if(h>0) display.drawLine(x,48-h,x,48,WHITE);
   }
-  int maxV = 1;
-  for (int i = 0; i < NRF_CHANNELS; i++)
-  {
-    if (nrfSmooth[i] > maxV) maxV = nrfSmooth[i];
-  }
-  if (maxV < 3) maxV = 3;
-  for (int x = 0; x < SCREEN_WIDTH; x++)
-  {
-    int ch = map(x, 0, SCREEN_WIDTH - 1, 0, NRF_CHANNELS - 1);
-    int sig = nrfSmooth[ch];
-    if (sig < 3) sig = 0;
-    int h = map(sig, 0, maxV, 0, 35);
-    if (h > 0)
-    {
-      display.drawLine(x, 48 - h, x, 48, SSD1306_WHITE);
-    }
-  }
-  display.drawLine(0, 48, SCREEN_WIDTH, 48, SSD1306_WHITE);
-  display.setCursor(2, 52);
-  display.printf("CH:%d", currentNrfChan);
-  display.setCursor(70, 52);
-  display.printf("%dMHz", 2400 + currentNrfChan);
+  display.drawLine(0,48,SCREEN_WIDTH,48,WHITE);
+  display.setCursor(2,52); display.printf("CH:%d",currentNrfChan);
+  display.setCursor(70,52); display.printf("%dMHz",2400+currentNrfChan);
   display.display();
 }
 
 void drawNrfJammer()
 {
   display.clearDisplay();
-  if (!nrfOk)
-  {
-    drawHeader("nRF24 Error");
-    display.setCursor(10, 30);
-    display.println(nrfErrorMsg);
-    display.display();
-    return;
-  }
-  char h[30];
-  sprintf(h, "%s Jam", jammerMode == BLE_JAMMER_MODE ? "BLE" : "BT");
+  if (!nrfOk) { drawHeader("nRF24 Error"); display.setCursor(10,30); display.println(nrfErrorMsg); display.display(); return; }
+  char h[30]; sprintf(h,"%s Jam", jammerMode==BLE_JAMMER_MODE?"BLE":"BT");
   if (jamming)
   {
     drawHeader(h);
-    display.setTextSize(2);
-    display.setCursor(20, 25);
-    display.println("JAMMING");
-    display.setTextSize(1);
-    display.setCursor(2, 56);
-    display.println("Hold OK to stop");
+    display.setTextSize(2); display.setCursor(20,25); display.println("JAMMING");
+    display.setTextSize(1); display.setCursor(2,56); display.println("Hold OK to stop");
   }
   else
   {
     drawHeader(h);
-    display.setCursor(15, 25);
-    display.printf("Mode: %s", jammerMode == BLE_JAMMER_MODE ? "BLE" : "Bluetooth");
-    display.setCursor(15, 37);
-    display.printf("nRF24: READY");
-    display.setCursor(15, 49);
-    display.print("Press start");
-    display.setCursor(2, 60);
-    display.print("Hold OK=change");
+    display.setCursor(15,25); display.printf("Mode: %s", jammerMode==BLE_JAMMER_MODE?"BLE":"Bluetooth");
+    display.setCursor(15,37); display.printf("nRF24: READY");
+    display.setCursor(15,49); display.print("Press start");
+    display.setCursor(2,60); display.print("Hold OK=change");
   }
   display.display();
 }
 
 void drawIrMenu()
 {
-  display.clearDisplay();
-  drawHeader("IR");
-  const char* items[] = {"Capture", "Transmit", "Erase All", "TV-B-Gone", "Back"};
-  for (int i = 0; i < IR_MENU_SIZE; i++)
-  {
-    drawItem(items[i], i == irMenuIdx, i);
-  }
+  display.clearDisplay(); drawHeader("IR");
+  const char* items[] = {"Capture","Transmit","Erase All","TV-B-Gone","Back"};
+  for (int i=0;i<IR_MENU_SIZE;i++) drawItem(items[i], i==irMenuIdx, i);
   display.display();
 }
 
 void drawIrCapture()
 {
-  display.clearDisplay();
-  drawHeader("IR Capture");
+  display.clearDisplay(); drawHeader("IR Capture");
   if (irCapturing)
   {
-    if (irTempReady)
-    {
-      display.setCursor(20, 30);
-      display.println("Captured!");
-    }
-    else
-    {
-      display.setCursor(25, 30);
-      display.println("Listening...");
-    }
-    display.setCursor(15, 42);
-    display.printf("Timeout: %ds", (irTimeout - millis()) / 1000);
+    if (irTempReady) display.setCursor(20,30); else display.setCursor(25,30);
+    display.println(irTempReady?"Captured!":"Listening...");
+    display.setCursor(15,42); display.printf("Timeout: %ds", (irTimeout-millis())/1000);
   }
-  else
-  {
-    display.setCursor(30, 30);
-    display.println("Press start");
-  }
-  display.setCursor(2, 56);
-  display.println("Press=save");
+  else display.setCursor(30,30), display.println("Press start");
+  display.setCursor(2,56); display.println("Press=save");
   display.display();
 }
 
 void drawIrTransmit()
 {
-  display.clearDisplay();
-  drawHeader("IR Transmit");
-  for (int i = 0; i < IR_SLOTS_COUNT; i++)
+  display.clearDisplay(); drawHeader("IR Transmit");
+  for (int i=0;i<IR_SLOTS_COUNT;i++)
   {
-    int y = 14 + i * 10;
-    if (i == irTxScroll)
-    {
-      display.fillRect(0, y - 1, SCREEN_WIDTH, 9, SSD1306_WHITE);
-      display.setTextColor(SSD1306_BLACK);
-      display.setCursor(2, y);
-      display.print(">");
-    }
-    else
-    {
-      display.setTextColor(SSD1306_WHITE);
-    }
-    display.setCursor(12, y);
-    display.printf("Slot %d: %s", i, irSlots[i].isValid ? "OK" : "Empty");
+    int y=14+i*10;
+    if (i==irTxScroll) { display.fillRect(0,y-1,SCREEN_WIDTH,9,WHITE); display.setTextColor(BLACK); display.setCursor(2,y); display.print(">"); }
+    else display.setTextColor(WHITE);
+    display.setCursor(12,y); display.printf("Slot %d: %s", i, irSlots[i].isValid?"OK":"Empty");
   }
-  int yb = 14 + IR_SLOTS_COUNT * 10;
-  if (irTxScroll == IR_SLOTS_COUNT)
-  {
-    display.fillRect(0, yb - 1, SCREEN_WIDTH, 9, SSD1306_WHITE);
-    display.setTextColor(SSD1306_BLACK);
-    display.setCursor(2, yb);
-    display.print(">");
-  }
-  else
-  {
-    display.setTextColor(SSD1306_WHITE);
-  }
-  display.setCursor(12, yb);
-  display.println("Back");
+  int yb=14+IR_SLOTS_COUNT*10;
+  if (irTxScroll==IR_SLOTS_COUNT) { display.fillRect(0,yb-1,SCREEN_WIDTH,9,WHITE); display.setTextColor(BLACK); display.setCursor(2,yb); display.print(">"); }
+  else display.setTextColor(WHITE);
+  display.setCursor(12,yb); display.println("Back");
   display.display();
 }
 
 void drawTvbgone()
 {
-  display.clearDisplay();
-  drawHeader("TV-B-Gone");
-  display.setCursor(10, 20);
-  display.println("Region:");
-  display.setCursor(30, 30);
-  if (tvbgone_region == 0)
-    display.println("NA");
-  else
-    display.println("EU");
-  display.setCursor(10, 45);
-  display.println("Action: Power");
-  display.setCursor(2, 56);
-  display.println("UP/DOWN=Reg  OK=Send");
+  display.clearDisplay(); drawHeader("TV-B-Gone");
+  display.setCursor(10,20); display.println("Region:");
+  display.setCursor(30,30); if (tvbgone_region==0) display.println("NA"); else display.println("EU");
+  display.setCursor(10,45); display.println("Action: Power");
+  display.setCursor(2,56); display.println("UP/DOWN=Reg  OK=Send");
   display.display();
 }
 
 void drawSettingsMenu()
 {
-  display.clearDisplay();
-  drawHeader("Settings");
-  const char* items[] = {"Info", "Timeout", "Reset", "Reboot", "Back"};
-  for (int i = 0; i < SETTINGS_SIZE; i++)
-  {
-    drawItem(items[i], i == settingsIdx, i);
-  }
+  display.clearDisplay(); drawHeader("Settings");
+  const char* items[] = {"Info","Timeout","Reset","Reboot","Back"};
+  for (int i=0;i<SETTINGS_SIZE;i++) drawItem(items[i], i==settingsIdx, i);
   display.display();
 }
 
 void drawSysInfo()
 {
-  display.clearDisplay();
-  drawHeader("System Info");
-  display.setCursor(2, 14);
-  display.printf("Chip: ESP32");
-  display.setCursor(2, 24);
-  display.printf("Flash: %d MB", ESP.getFlashChipSize() / 1048576);
-  display.setCursor(2, 34);
-  display.printf("Heap: %d KB", ESP.getFreeHeap() / 1024);
-  display.setCursor(2, 44);
-  display.printf("Uptime: %ds", (millis() - deviceBootTime) / 1000);
-  display.setCursor(2, 54);
-  display.printf("nRF24: %s", nrfOk ? "OK" : "FAIL");
-  display.setCursor(2, 60);
-  display.println("Press=back");
+  display.clearDisplay(); drawHeader("System Info");
+  display.setCursor(2,14); display.printf("Chip: ESP32");
+  display.setCursor(2,24); display.printf("Flash: %d MB", ESP.getFlashChipSize()/1048576);
+  display.setCursor(2,34); display.printf("Heap: %d KB", ESP.getFreeHeap()/1024);
+  display.setCursor(2,44); display.printf("Uptime: %ds", (millis()-deviceBootTime)/1000);
+  display.setCursor(2,54); display.printf("nRF24: %s", nrfOk?"OK":"FAIL");
+  display.setCursor(2,60); display.println("Press=back");
   display.display();
 }
 
 void drawTimeoutMenu()
 {
-  display.clearDisplay();
-  drawHeader("Display Timeout");
-  const char* opts[] = {"Off", "10s", "30s", "1min", "5min"};
-  int vals[] = {0, 10, 30, 60, 300};
-  int idx = 0;
-  for (int i = 0; i < 5; i++)
-  {
-    if (vals[i] == timeoutVal) idx = i;
-  }
-  display.setCursor(30, 30);
-  display.printf("Timeout: %s", opts[idx]);
-  display.setCursor(2, 56);
-  display.println("UP/DOWN=chg  OK=save");
+  display.clearDisplay(); drawHeader("Display Timeout");
+  const char* opts[]={"Off","10s","30s","1min","5min"};
+  int vals[]={0,10,30,60,300};
+  int idx=0; for(int i=0;i<5;i++) if(vals[i]==timeoutVal) idx=i;
+  display.setCursor(30,30); display.printf("Timeout: %s",opts[idx]);
+  display.setCursor(2,56); display.println("UP/DOWN=chg  OK=save");
   display.display();
 }
 
 void drawResetConfirm()
 {
-  display.clearDisplay();
-  drawHeader("Reset Device!");
-  display.setCursor(15, 25);
-  display.println("Reset ALL?");
-  display.setCursor(15, 37);
-  display.println("UP=YES  DOWN=NO");
+  display.clearDisplay(); drawHeader("Reset Device!");
+  display.setCursor(15,25); display.println("Reset ALL?");
+  display.setCursor(15,37); display.println("UP=YES  DOWN=NO");
   display.display();
 }
 
 void drawRebootConfirm()
 {
-  display.clearDisplay();
-  drawHeader("Reboot");
-  display.setCursor(15, 30);
-  display.println("Reboot?");
-  display.setCursor(15, 42);
-  display.println("UP=YES  DOWN=NO");
+  display.clearDisplay(); drawHeader("Reboot");
+  display.setCursor(15,30); display.println("Reboot?");
+  display.setCursor(15,42); display.println("UP=YES  DOWN=NO");
   display.display();
 }
 
-// ========================== ОБРАБОТКА КНОПОК ==========================
+// -------------------------- КОНСОЛЬНЫЕ ФУНКЦИИ --------------------------
+void drawKeyboard()
+{
+  display.clearDisplay();
+  display.drawRect(0, 0, 128, 10, WHITE);
+  display.setCursor(2, 2);
+  String visible = consoleText;
+  if (visible.length() > 18) visible = visible.substring(visible.length() - 18);
+  display.print(visible);
+  for (int row = 0; row < 5; row++)
+  {
+    for (int col = 0; col < 8; col++)
+    {
+      int index = row * 8 + col;
+      if (index >= totalKeys) break;
+      int x = col * 16;
+      int y = 13 + row * 10;
+      if (index == selectedKey)
+      {
+        display.fillRect(x, y, 15, 9, WHITE);
+        display.setTextColor(BLACK);
+      }
+      else display.setTextColor(WHITE);
+      String key = capsLock ? upperKeys[index] : lowerKeys[index];
+      display.setCursor(x + 1, y + 1);
+      display.print(key);
+    }
+  }
+  display.setTextColor(WHITE);
+  display.display();
+}
+
+String inputStringWithKeyboard(bool allowExit, const char* title)
+{
+  String result = "";
+  int localSelected = 0;
+  bool localCaps = false;
+  bool okProcessed = false;
+  unsigned long lastMoveTime = 0;
+  bool upHeld = false, downHeld = false;
+  
+  int oldSelected = selectedKey;
+  bool oldCaps = capsLock;
+  String oldText = consoleText;
+  
+  selectedKey = localSelected;
+  capsLock = localCaps;
+  consoleText = result;
+  
+  while (true)
+  {
+    display.clearDisplay();
+    display.drawRect(0, 0, 128, 10, WHITE);
+    display.setCursor(2, 2);
+    display.print(title);
+    display.fillRect(0, 12, 128, 8, BLACK);
+    display.setCursor(2, 13);
+    String visible = result;
+    if (visible.length() > 18) visible = visible.substring(visible.length() - 18);
+    display.print(visible);
+    display.display();
+    
+    for (int row = 0; row < 5; row++)
+    {
+      for (int col = 0; col < 8; col++)
+      {
+        int index = row * 8 + col;
+        if (index >= totalKeys) break;
+        int x = col * 16;
+        int y = 18 + row * 10;
+        if (index == localSelected)
+        {
+          display.fillRect(x, y, 15, 9, WHITE);
+          display.setTextColor(BLACK);
+        }
+        else display.setTextColor(WHITE);
+        String key = localCaps ? upperKeys[index] : lowerKeys[index];
+        display.setCursor(x + 1, y + 1);
+        display.print(key);
+      }
+    }
+    display.setTextColor(WHITE);
+    display.display();
+    
+    bool up = btnUp();
+    bool down = btnDown();
+    if (up)
+    {
+      if (!upHeld)
+      {
+        upHeld = true;
+        lastMoveTime = millis();
+        localSelected--;
+        if (localSelected < 0) localSelected = totalKeys - 1;
+      }
+      else if (millis() - lastMoveTime > CONSOLE_AUTOREPEAT_DELAY)
+      {
+        lastMoveTime = millis();
+        localSelected--;
+        if (localSelected < 0) localSelected = totalKeys - 1;
+      }
+    }
+    else upHeld = false;
+    
+    if (down)
+    {
+      if (!downHeld)
+      {
+        downHeld = true;
+        lastMoveTime = millis();
+        localSelected++;
+        if (localSelected >= totalKeys) localSelected = 0;
+      }
+      else if (millis() - lastMoveTime > CONSOLE_AUTOREPEAT_DELAY)
+      {
+        lastMoveTime = millis();
+        localSelected++;
+        if (localSelected >= totalKeys) localSelected = 0;
+      }
+    }
+    else downHeld = false;
+    
+    if (btnOk() && !okProcessed)
+    {
+      okProcessed = true;
+      String key = localCaps ? upperKeys[localSelected] : lowerKeys[localSelected];
+      if (key == "Caps")
+      {
+        localCaps = !localCaps;
+      }
+      else if (key == "Del")
+      {
+        if (result.length() > 0) result.remove(result.length() - 1);
+      }
+      else if (key == "OK")
+      {
+        selectedKey = oldSelected;
+        capsLock = oldCaps;
+        consoleText = oldText;
+        drawKeyboard();
+        return result;
+      }
+      else if (key == "Exit" && allowExit)
+      {
+        selectedKey = oldSelected;
+        capsLock = oldCaps;
+        consoleText = oldText;
+        drawKeyboard();
+        return "";
+      }
+      else if (key == "Space")
+      {
+        result += " ";
+      }
+      else
+      {
+        result += key;
+      }
+      consoleText = result;
+      delay(150);
+    }
+    if (!btnOk()) okProcessed = false;
+    delay(20);
+  }
+}
+
+void showCommandOutput(String output, int timeoutSeconds)
+{
+  commandOutput = output;
+  commandStartTime = millis();
+  commandTimeoutSec = timeoutSeconds;
+  waitingForOk = true;
+  appState = STATE_CONSOLE_COMMAND_OUTPUT;
+  needRedraw = true;
+}
+
+void executeCommand(String cmd)
+{
+  cmd.toLowerCase();
+  if (cmd == CMD_INFO)
+  {
+    consoleMode = CONSOLE_INFO;
+    infoPage = 0;
+  }
+  else if (cmd == CMD_DEV)
+  {
+    consoleMode = CONSOLE_DEV;
+    codePos = 0;
+  }
+  else if (cmd == CMD_CLEAR)
+  {
+    consoleText = "";
+  }
+  else if (cmd == CMD_SFV)
+  {
+    showCommandOutput("Scanning WiFi...", 0);
+    bool oldWifiSpectrum = wifiSpectrumActive;
+    if (!oldWifiSpectrum)
+    {
+      wifiSpectrumActive = true;
+      totalPackets = 0;
+      memset(wifiPackets, 0, sizeof(wifiPackets));
+      memset(wifiSmooth, 0, sizeof(wifiSmooth));
+      esp_wifi_set_promiscuous(true);
+      esp_wifi_set_promiscuous_rx_cb([](void* buf, wifi_promiscuous_pkt_type_t type){
+        wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+        int ch = pkt->rx_ctrl.channel;
+        if (ch >= 1 && ch <= WIFI_CHANNELS) {
+          wifiPackets[ch]++;
+          totalPackets++;
+        }
+      });
+      esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+    }
+    unsigned long start = millis();
+    while (millis() - start < 2000)
+    {
+      static unsigned long lastSwitch = 0;
+      if (millis() - lastSwitch > 100)
+      {
+        currentWifiChan = (currentWifiChan % WIFI_CHANNELS) + 1;
+        esp_wifi_set_channel(currentWifiChan, WIFI_SECOND_CHAN_NONE);
+        lastSwitch = millis();
+      }
+      yield();
+    }
+    int maxChan = 1;
+    int maxPkts = 0;
+    for (int ch = 1; ch <= WIFI_CHANNELS; ch++)
+    {
+      if (wifiPackets[ch] > maxPkts)
+      {
+        maxPkts = wifiPackets[ch];
+        maxChan = ch;
+      }
+    }
+    if (!oldWifiSpectrum)
+    {
+      wifiSpectrumActive = false;
+      esp_wifi_set_promiscuous(false);
+      esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+    }
+    int freqMHz = 2407 + (maxChan - 1) * 5;
+    String result = "Strongest WiFi: channel " + String(maxChan) + " (" + String(freqMHz) + " MHz) packets=" + String(maxPkts);
+    showCommandOutput(result, COMMAND_TIMEOUT_SFV);
+    return;
+  }
+  else if (cmd == CMD_CS)
+  {
+    if (!nrfOk)
+    {
+      showCommandOutput("nRF24 not found!", COMMAND_TIMEOUT_CS);
+      return;
+    }
+    showCommandOutput("Scanning nRF24...", 0);
+    bool oldJam = jamming;
+    if (oldJam) stopJammer();
+    radio.powerUp();
+    radio.stopListening();
+    radio.setPALevel(RF24_PA_MAX);
+    int maxSignal = -100;
+    int maxChannel = -1;
+    for (int ch = 0; ch < NRF_CHANNELS; ch++)
+    {
+      radio.setChannel(ch);
+      radio.startListening();
+      delayMicroseconds(150);
+      int rssi = radio.testCarrier() ? 40 : 0;
+      radio.stopListening();
+      if (nrfCalibrated) rssi -= nrfFloor[ch];
+      if (rssi < 0) rssi = 0;
+      if (rssi > maxSignal)
+      {
+        maxSignal = rssi;
+        maxChannel = ch;
+      }
+      yield();
+    }
+    if (oldJam) startJammer();
+    int freqMHz = 2400 + maxChannel;
+    String result = "Max nRF24: channel " + String(maxChannel) + " (" + String(freqMHz) + " MHz) signal=" + String(maxSignal);
+    showCommandOutput(result, COMMAND_TIMEOUT_CS);
+    return;
+  }
+  else if (cmd == CMD_EXIT)
+  {
+    appState = STATE_MAIN_MENU;
+    needRedraw = true;
+    return;
+  }
+  else if (cmd == CMD_AP)
+  {
+    adminPanel();
+    return;
+  }
+  else if (cmd.length() > 0)
+  {
+    showCommandOutput("Unknown: " + cmd, 1);
+    return;
+  }
+  drawKeyboard();
+}
+
+void consoleInfoMode()
+{
+  static bool btnProcessed = false;
+  static unsigned long longPressStart = 0;
+  static bool longPressTriggered = false;
+  if (btnOk())
+  {
+    if (!longPressTriggered)
+    {
+      if (longPressStart == 0) longPressStart = millis();
+      else if (millis() - longPressStart >= 3000)
+      {
+        longPressTriggered = true;
+        consoleMode = CONSOLE_KEYBOARD;
+        drawKeyboard();
+        return;
+      }
+    }
+  }
+  else
+  {
+    longPressStart = 0;
+    longPressTriggered = false;
+  }
+  if (btnUp() && !btnProcessed)
+  {
+    infoPage--;
+    if (infoPage < 0) infoPage = totalInfo - 1;
+    btnProcessed = true;
+    delay(150);
+  }
+  else if (btnDown() && !btnProcessed)
+  {
+    infoPage++;
+    if (infoPage >= totalInfo) infoPage = 0;
+    btnProcessed = true;
+    delay(150);
+  }
+  if (!btnUp() && !btnDown()) btnProcessed = false;
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("SYSTEM INFO");
+  display.drawLine(0,10,128,10,WHITE);
+  display.setCursor(0,25);
+  display.println(infoLines[infoPage]);
+  display.setCursor(0,56);
+  display.print(String(infoPage+1) + "/" + String(totalInfo));
+  display.display();
+}
+
+void consoleDevMode()
+{
+  static unsigned long longPressStart = 0;
+  static bool longPressTriggered = false;
+  static bool btnWasPressed = false;
+  static unsigned long devStartTime = 0;
+  static unsigned long lastDraw = 0;
+  if (DEV_MODE_TIMEOUT > 0 && devStartTime == 0) devStartTime = millis();
+  if (btnOk())
+  {
+    if (!btnWasPressed)
+    {
+      btnWasPressed = true;
+      longPressStart = millis();
+      longPressTriggered = false;
+    }
+    else if (!longPressTriggered && (millis() - longPressStart >= 3000))
+    {
+      longPressTriggered = true;
+      consoleMode = CONSOLE_KEYBOARD;
+      drawKeyboard();
+      return;
+    }
+  }
+  else
+  {
+    btnWasPressed = false;
+    longPressTriggered = false;
+  }
+  if (DEV_MODE_TIMEOUT > 0 && (millis() - devStartTime >= DEV_MODE_TIMEOUT * 1000UL))
+  {
+    consoleMode = CONSOLE_KEYBOARD;
+    drawKeyboard();
+    return;
+  }
+  if (millis() - lastDraw > 30)
+  {
+    display.clearDisplay();
+    for (int i = 0; i < 200; i++) display.drawPixel(random(128), random(64), WHITE);
+    for (int i = 0; i < 20; i++)
+    {
+      int x1 = random(128), y1 = random(64), x2 = random(128), y2 = random(64);
+      display.drawLine(x1, y1, x2, y2, WHITE);
+    }
+    for (int i = 0; i < 10; i++)
+    {
+      int x = random(128), y = random(64), w = random(20), h = random(20);
+      display.fillRect(x, y, w, h, WHITE);
+    }
+    display.display();
+    lastDraw = millis();
+  }
+  static unsigned long lastSeqTime = 0;
+  static bool upProcessed = false, downProcessed = false, okProcessedShort = false;
+  if (btnUp() && !upProcessed)
+  {
+    enteredCode[codePos] = 1;
+    codePos++;
+    upProcessed = true;
+    lastSeqTime = millis();
+  }
+  else if (btnDown() && !downProcessed)
+  {
+    enteredCode[codePos] = 3;
+    codePos++;
+    downProcessed = true;
+    lastSeqTime = millis();
+  }
+  else if (btnOk() && !okProcessedShort && !longPressTriggered)
+  {
+    enteredCode[codePos] = 2;
+    codePos++;
+    okProcessedShort = true;
+    lastSeqTime = millis();
+  }
+  if (!btnUp()) upProcessed = false;
+  if (!btnDown()) downProcessed = false;
+  if (!btnOk()) okProcessedShort = false;
+  if (codePos > 0 && (millis() - lastSeqTime > 1000)) codePos = 0;
+  if (codePos >= 9)
+  {
+    bool correct = true;
+    for (int i = 0; i < 9; i++) if (enteredCode[i] != secretCode[i]) correct = false;
+    if (correct)
+    {
+      consoleMode = CONSOLE_KEYBOARD;
+      drawKeyboard();
+    }
+    codePos = 0;
+  }
+}
+
+void consoleLoop()
+{
+  if (consoleMode == CONSOLE_INFO)
+  {
+    consoleInfoMode();
+    return;
+  }
+  if (consoleMode == CONSOLE_DEV)
+  {
+    consoleDevMode();
+    return;
+  }
+  static unsigned long lastMoveTime = 0;
+  static bool upHeld = false, downHeld = false;
+  static bool okProcessed = false;
+  if (btnUp())
+  {
+    if (!upHeld)
+    {
+      upHeld = true;
+      lastMoveTime = millis();
+      selectedKey--;
+      if (selectedKey < 0) selectedKey = totalKeys - 1;
+      drawKeyboard();
+    }
+    else if (millis() - lastMoveTime > CONSOLE_AUTOREPEAT_DELAY)
+    {
+      lastMoveTime = millis();
+      selectedKey--;
+      if (selectedKey < 0) selectedKey = totalKeys - 1;
+      drawKeyboard();
+    }
+  }
+  else upHeld = false;
+  if (btnDown())
+  {
+    if (!downHeld)
+    {
+      downHeld = true;
+      lastMoveTime = millis();
+      selectedKey++;
+      if (selectedKey >= totalKeys) selectedKey = 0;
+      drawKeyboard();
+    }
+    else if (millis() - lastMoveTime > CONSOLE_AUTOREPEAT_DELAY)
+    {
+      lastMoveTime = millis();
+      selectedKey++;
+      if (selectedKey >= totalKeys) selectedKey = 0;
+      drawKeyboard();
+    }
+  }
+  else downHeld = false;
+  if (btnOk() && !okProcessed)
+  {
+    okProcessed = true;
+    String key = capsLock ? upperKeys[selectedKey] : lowerKeys[selectedKey];
+    if (key == "Caps")
+    {
+      capsLock = !capsLock;
+      drawKeyboard();
+    }
+    else if (key == "Del")
+    {
+      if (consoleText.length() > 0) consoleText.remove(consoleText.length() - 1);
+      drawKeyboard();
+    }
+    else if (key == "OK")
+    {
+      executeCommand(consoleText);
+      consoleText = "";
+      if (appState == STATE_CONSOLE && consoleMode == CONSOLE_KEYBOARD)
+        drawKeyboard();
+    }
+    else if (key == "Exit")
+    {
+      appState = STATE_MAIN_MENU;
+      needRedraw = true;
+      return;
+    }
+    else if (key == "Space")
+    {
+      consoleText += " ";
+      drawKeyboard();
+    }
+    else
+    {
+      consoleText += key;
+      drawKeyboard();
+    }
+    delay(150);
+  }
+  if (!btnOk()) okProcessed = false;
+}
+
+// -------------------------- АДМИН-ПАНЕЛЬ (УПРОЩЁННАЯ ДЛЯ АНАЛОГОВЫХ КНОПОК) --------------------------
+int editPinValue(const char* prompt)
+{
+  consoleText = "";
+  selectedKey = 0;
+  capsLock = false;
+  drawKeyboard();
+  bool okProcessed = false;
+  unsigned long lastMove = 0;
+  bool upHeld = false, downHeld = false;
+  while (true)
+  {
+    bool up = btnUp(), down = btnDown();
+    if (up)
+    {
+      if (!upHeld)
+      {
+        selectedKey = (selectedKey - 1 + totalKeys) % totalKeys;
+        drawKeyboard();
+        upHeld = true;
+        lastMove = millis();
+        delay(150);
+      }
+      else if (millis() - lastMove > 150)
+      {
+        selectedKey = (selectedKey - 1 + totalKeys) % totalKeys;
+        drawKeyboard();
+        lastMove = millis();
+      }
+    }
+    else upHeld = false;
+    if (down)
+    {
+      if (!downHeld)
+      {
+        selectedKey = (selectedKey + 1) % totalKeys;
+        drawKeyboard();
+        downHeld = true;
+        lastMove = millis();
+        delay(150);
+      }
+      else if (millis() - lastMove > 150)
+      {
+        selectedKey = (selectedKey + 1) % totalKeys;
+        drawKeyboard();
+        lastMove = millis();
+      }
+    }
+    else downHeld = false;
+    if (btnOk() && !okProcessed)
+    {
+      okProcessed = true;
+      String key = capsLock ? upperKeys[selectedKey] : lowerKeys[selectedKey];
+      if (key == "OK")
+      {
+        int val = consoleText.toInt();
+        if ((val >= 0 && val <= 10) || val == 20 || val == 21)
+          return val;
+        else
+        {
+          display.clearDisplay();
+          display.setCursor(10, 28);
+          display.print("Invalid pin (0-10,20,21)");
+          display.display();
+          delay(1500);
+          consoleText = "";
+          drawKeyboard();
+        }
+      }
+      else if (key == "Del")
+      {
+        if (consoleText.length() > 0) consoleText.remove(consoleText.length() - 1);
+        drawKeyboard();
+      }
+      else if (key == "Exit")
+      {
+        return -1;
+      }
+      else if (key == "Space")
+      {
+        consoleText += " ";
+        drawKeyboard();
+      }
+      else if (key == "Caps")
+      {
+        capsLock = !capsLock;
+        drawKeyboard();
+      }
+      else
+      {
+        consoleText += key;
+        drawKeyboard();
+      }
+      delay(150);
+    }
+    if (!btnOk()) okProcessed = false;
+    delay(20);
+  }
+}
+
+void changePins()
+{
+  display.clearDisplay();
+  drawHeader("Change pins");
+  display.setCursor(10, 28);
+  display.println("Not available");
+  display.setCursor(10, 40);
+  display.println("Analog buttons");
+  display.display();
+  delay(2000);
+}
+
+void setBrightness()
+{
+  while (true)
+  {
+    display.clearDisplay();
+    drawHeader("Brightness");
+    display.setCursor(10, 20);
+    display.print("Bright: ");
+    display.print(displayBrightness);
+    display.setCursor(10, 40);
+    display.println("UP/DOWN adjust, OK save");
+    display.display();
+    if (btnUp()) { displayBrightness = constrain(displayBrightness + 5, 0, 255); delay(150); }
+    if (btnDown()) { displayBrightness = constrain(displayBrightness - 5, 0, 255); delay(150); }
+    if (btnOk())
+    {
+      display.ssd1306_command(SSD1306_SETCONTRAST);
+      display.ssd1306_command(displayBrightness);
+      display.clearDisplay();
+      display.setCursor(20, 28);
+      display.print("Brightness saved");
+      display.display();
+      delay(1000);
+      return;
+    }
+    delay(50);
+  }
+}
+
+void setInvert()
+{
+  displayInvert = !displayInvert;
+  if (displayInvert) display.ssd1306_command(SSD1306_INVERTDISPLAY);
+  else display.ssd1306_command(SSD1306_NORMALDISPLAY);
+  display.clearDisplay();
+  display.setCursor(20, 28);
+  display.print(displayInvert ? "Display inverted" : "Display normal");
+  display.display();
+  delay(1000);
+}
+
+void showProcesses()
+{
+  while (true)
+  {
+    display.clearDisplay();
+    drawHeader("Processes");
+    display.setCursor(2, 15);  display.printf("Heap free: %d KB", ESP.getFreeHeap() / 1024);
+    display.setCursor(2, 25);  display.printf("Uptime: %d sec", millis() / 1000);
+    display.setCursor(2, 35);  display.printf("CPU freq: %d MHz", ESP.getCpuFreqMHz());
+    display.setCursor(2, 45);  display.printf("IR buffer: %d", irBufferSize);
+    display.setCursor(2, 55);  display.println("Press OK to exit");
+    display.display();
+    if (btnOk()) break;
+    delay(50);
+  }
+}
+
+void reinitHardware()
+{
+  Wire.begin(OLED_SDA, OLED_SCL);
+  display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
+  display.clearDisplay();
+}
+
+void drawAdminMenuHighlight(int sel)
+{
+  display.clearDisplay();
+  drawHeader("Admin Panel");
+  const char* items[] = {"Change pins", "Brightness", "Invert display", "Processes", "Exit admin"};
+  for (int i = 0; i < 5; i++)
+  {
+    int y = 15 + i * 10;
+    if (i == sel)
+    {
+      display.fillRect(0, y - 2, SCREEN_WIDTH, 12, WHITE);
+      display.setTextColor(BLACK);
+    }
+    else
+    {
+      display.setTextColor(WHITE);
+    }
+    display.setCursor(5, y);
+    display.print(i + 1);
+    display.print(". ");
+    display.print(items[i]);
+  }
+  display.display();
+}
+
+void adminPanel()
+{
+  String pwd = inputStringWithKeyboard(true, "ENTER PASSWORD:");
+  if (pwd == adminPassword && pwd != "")
+  {
+    adminMode = true;
+    display.clearDisplay();
+    display.setCursor(20, 28);
+    display.println("Access granted");
+    display.display();
+    delay(1000);
+  }
+  else
+  {
+    if (pwd != "") showCommandOutput("Wrong password", 2);
+    return;
+  }
+  while (adminMode)
+  {
+    int sel = 0;
+    bool okPressed = false;
+    drawAdminMenuHighlight(sel);
+    while (true)
+    {
+      bool up = btnUp(), down = btnDown(), ok = btnOk();
+      if (up)
+      {
+        sel = (sel - 1 + 5) % 5;
+        drawAdminMenuHighlight(sel);
+        delay(150);
+      }
+      if (down)
+      {
+        sel = (sel + 1) % 5;
+        drawAdminMenuHighlight(sel);
+        delay(150);
+      }
+      if (ok && !okPressed)
+      {
+        okPressed = true;
+        switch (sel)
+        {
+          case 0: changePins(); break;
+          case 1: setBrightness(); break;
+          case 2: setInvert(); break;
+          case 3: showProcesses(); break;
+          case 4: adminMode = false; showMsg("Exited admin mode"); return;
+        }
+        break;
+      }
+      if (!ok) okPressed = false;
+      delay(50);
+    }
+  }
+}
+
+// -------------------------- ОБРАБОТКА КНОПОК (ДОЛГОЕ НАЖАТИЕ) --------------------------
 void handleButtons()
 {
   static bool okWasPressed = false;
@@ -1291,14 +1935,9 @@ void handleButtons()
       }
       else
       {
-        if (jammerMode == BLE_JAMMER_MODE)
-          jammerMode = BLUETOOTH_JAMMER_MODE;
-        else
-          jammerMode = BLE_JAMMER_MODE;
-        if (jammerMode == BLE_JAMMER_MODE)
-          showMsg("Mode: BLE");
-        else
-          showMsg("Mode: Bluetooth");
+        jammerMode = (jammerMode == BLE_JAMMER_MODE) ? BLUETOOTH_JAMMER_MODE : BLE_JAMMER_MODE;
+        if (jammerMode == BLE_JAMMER_MODE) showMsg("Mode: BLE");
+        else showMsg("Mode: Bluetooth");
         needRedraw = true;
       }
     }
@@ -1318,7 +1957,7 @@ void handleButtons()
   }
 }
 
-// ========================== ОБНОВЛЕНИЕ ДИСПЛЕЯ ==========================
+// -------------------------- ОБНОВЛЕНИЕ ДИСПЛЕЯ --------------------------
 void updateDisplay()
 {
   if (!displayOn) return;
@@ -1328,6 +1967,33 @@ void updateDisplay()
     display.setCursor(20, 28);
     display.println(statusMsg);
     display.display();
+    return;
+  }
+  if (appState == STATE_CONSOLE_COMMAND_OUTPUT)
+  {
+    display.clearDisplay();
+    display.setCursor(0, 10);
+    display.println(commandOutput);
+    display.setCursor(0, 50);
+    display.println("Press OK to exit");
+    display.display();
+    if (btnOk())
+    {
+      waitingForOk = false;
+      appState = STATE_CONSOLE;
+      consoleMode = CONSOLE_KEYBOARD;
+      drawKeyboard();
+      needRedraw = true;
+      return;
+    }
+    if (commandTimeoutSec > 0 && (millis() - commandStartTime >= commandTimeoutSec * 1000UL))
+    {
+      waitingForOk = false;
+      appState = STATE_CONSOLE;
+      consoleMode = CONSOLE_KEYBOARD;
+      drawKeyboard();
+      needRedraw = true;
+    }
     return;
   }
   switch (appState)
@@ -1345,6 +2011,7 @@ void updateDisplay()
     case STATE_IR_CAPTURE: drawIrCapture(); break;
     case STATE_IR_TRANSMIT: drawIrTransmit(); break;
     case STATE_TVBGONE: drawTvbgone(); break;
+    case STATE_CONSOLE: consoleLoop(); break;
     case STATE_SETTINGS_MENU: drawSettingsMenu(); break;
     case STATE_SYSTEM_INFO: drawSysInfo(); break;
     case STATE_TIMEOUT: drawTimeoutMenu(); break;
@@ -1355,7 +2022,47 @@ void updateDisplay()
   needRedraw = false;
 }
 
-// ========================== ГЛАВНЫЙ ЦИКЛ ==========================
+// -------------------------- ГЛАВНЫЙ ЦИКЛ --------------------------
+void setup()
+{
+  delay(500);
+  deviceBootTime = millis();
+  lastActivityTime = millis();
+  Serial.begin(115200);
+  Serial.println("\ncatZERO v2.2 Starting");
+
+  pinMode(BTN_ANALOG_PIN, INPUT);
+  loadTimeout();
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) for(;;);
+  showBootLogo();
+
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, RF_CSN_PIN);
+  SPI.setFrequency(8000000);
+
+  if (radio.begin(RF_CE_PIN, RF_CSN_PIN) && radio.isChipConnected())
+  {
+    nrfOk = true; nrfErrorMsg = "OK";
+    radio.setChannel(42); radio.setPALevel(RF24_PA_MAX,true);
+    radio.setAutoAck(false); radio.disableCRC(); radio.stopListening();
+    Serial.println("nRF24 OK");
+  }
+  else { nrfOk = false; nrfErrorMsg = "not found"; Serial.println("nRF24 FAIL"); }
+
+  irRx = new IRrecv(IR_RX_PIN); irRx->enableIRIn(); irRxOk = true;
+  irTx = new IRsend(IR_TX_PIN); irTx->begin();
+  for (int i=0;i<IR_SLOTS_COUNT;i++) irSlots[i].isValid = false;
+  loadIrSlots();
+
+  WiFi.mode(WIFI_MODE_NULL); esp_wifi_start(); delay(50);
+  initSDCard();
+
+  memset(nrfSmooth,0,sizeof(nrfSmooth)); memset(wifiSmooth,0,sizeof(wifiSmooth));
+  appState = STATE_MAIN_MENU; needRedraw = true;
+  Serial.println("Setup complete");
+}
+
 void loop()
 {
   handleButtons();
@@ -1364,25 +2071,13 @@ void loop()
   bool down = btnDown();
   bool ok = btnOk() && !longPressDetected;
 
-  // Кнопка сброса на GPIO10
-  if (digitalRead(BTN_RESET) == LOW)
-  {
-    delay(50);
-    if (digitalRead(BTN_RESET) == LOW)
-    {
-      ESP.restart();
-    }
-  }
-
   if (!displayOn && (up || down || ok))
   {
     setPower(true);
     lastActivityTime = millis();
     needRedraw = true;
     delay(100);
-    up = false;
-    down = false;
-    ok = false;
+    up = false; down = false; ok = false;
   }
   if ((up || down || ok) && displayOn)
   {
@@ -1390,336 +2085,221 @@ void loop()
     needRedraw = true;
   }
 
-  // UP
-  if (up)
+  if (appState != STATE_CONSOLE && appState != STATE_CONSOLE_COMMAND_OUTPUT)
   {
-    switch (appState)
+    if (up)
     {
-      case STATE_MAIN_MENU:
-        mainIdx = (mainIdx - 1 + MAIN_SIZE) % MAIN_SIZE;
-        break;
-      case STATE_WIFI_MENU:
-        wifiMenuIdx = (wifiMenuIdx - 1 + WIFI_MENU_SIZE) % WIFI_MENU_SIZE;
-        break;
-      case STATE_WIFI_SCAN:
-        if (!wifiScanning)
-        {
-          int sz = wifiList.size();
-          if (wifiSelectedIdx == -1)
-          {
-            if (sz > 0) wifiSelectedIdx = sz - 1;
-          }
-          else
-          {
-            int newIdx = wifiSelectedIdx - 1;
-            if (newIdx >= 0) wifiSelectedIdx = newIdx;
-            else if (newIdx == -1) wifiSelectedIdx = -1;
-          }
-        }
-        break;
-      case STATE_WIFI_ACTIONS:
-        wifiActionIdx = (wifiActionIdx - 1 + WIFI_ACTIONS_SIZE) % WIFI_ACTIONS_SIZE;
-        break;
-      case STATE_NRF24_MENU:
-        nrfMenuIdx = (nrfMenuIdx - 1 + NRF_MENU_SIZE) % NRF_MENU_SIZE;
-        break;
-      case STATE_IR_MENU:
-        irMenuIdx = (irMenuIdx - 1 + IR_MENU_SIZE) % IR_MENU_SIZE;
-        break;
-      case STATE_IR_TRANSMIT:
-        irTxScroll = (irTxScroll - 1 + IR_SLOTS_COUNT + 1) % (IR_SLOTS_COUNT + 1);
-        break;
-      case STATE_SETTINGS_MENU:
-        settingsIdx = (settingsIdx - 1 + SETTINGS_SIZE) % SETTINGS_SIZE;
-        break;
-      case STATE_TIMEOUT:
+      switch (appState)
       {
-        int opts[] = {0, 10, 30, 60, 300};
-        int idx = 0;
-        for (int i = 0; i < 5; i++) if (opts[i] == timeoutVal) idx = i;
-        idx = (idx - 1 + 5) % 5;
-        timeoutVal = opts[idx];
-        needRedraw = true;
-        break;
-      }
-      case STATE_TVBGONE:
-        tvbgone_region = !tvbgone_region;
-        delay(200);
-        break;
-      case STATE_RESET_CONFIRM:
-        EEPROM.begin(EEPROM_SIZE_BYTES);
-        for (int i = 0; i < EEPROM_SIZE_BYTES; i++) EEPROM.write(i, 0xFF);
-        EEPROM.commit();
-        EEPROM.end();
-        delay(500);
-        ESP.restart();
-        break;
-      case STATE_REBOOT_CONFIRM:
-        ESP.restart();
-        break;
-      default:
-        break;
-    }
-    delay(150);
-  }
-
-  // DOWN
-  if (down)
-  {
-    switch (appState)
-    {
-      case STATE_MAIN_MENU:
-        mainIdx = (mainIdx + 1) % MAIN_SIZE;
-        break;
-      case STATE_WIFI_MENU:
-        wifiMenuIdx = (wifiMenuIdx + 1) % WIFI_MENU_SIZE;
-        break;
-      case STATE_WIFI_SCAN:
-        if (!wifiScanning)
-        {
-          int sz = wifiList.size();
-          if (wifiSelectedIdx == -1)
+        case STATE_MAIN_MENU: mainIdx = (mainIdx - 1 + MAIN_SIZE) % MAIN_SIZE; break;
+        case STATE_WIFI_MENU: wifiMenuIdx = (wifiMenuIdx - 1 + WIFI_MENU_SIZE) % WIFI_MENU_SIZE; break;
+        case STATE_WIFI_SCAN:
+          if (!wifiScanning)
           {
-            if (sz > 0) wifiSelectedIdx = 0;
+            int sz = wifiList.size();
+            if (wifiSelectedIdx == -1) { if (sz > 0) wifiSelectedIdx = sz - 1; }
+            else { int newIdx = wifiSelectedIdx - 1; if (newIdx >= 0) wifiSelectedIdx = newIdx; else if (newIdx == -1) wifiSelectedIdx = -1; }
           }
-          else
-          {
-            int newIdx = wifiSelectedIdx + 1;
-            if (newIdx < sz) wifiSelectedIdx = newIdx;
-            else if (newIdx == sz) wifiSelectedIdx = -1;
-          }
+          break;
+        case STATE_WIFI_ACTIONS: wifiActionIdx = (wifiActionIdx - 1 + WIFI_ACTIONS_SIZE) % WIFI_ACTIONS_SIZE; break;
+        case STATE_NRF24_MENU: nrfMenuIdx = (nrfMenuIdx - 1 + NRF_MENU_SIZE) % NRF_MENU_SIZE; break;
+        case STATE_IR_MENU: irMenuIdx = (irMenuIdx - 1 + IR_MENU_SIZE) % IR_MENU_SIZE; break;
+        case STATE_IR_TRANSMIT: irTxScroll = (irTxScroll - 1 + IR_SLOTS_COUNT + 1) % (IR_SLOTS_COUNT + 1); break;
+        case STATE_SETTINGS_MENU: settingsIdx = (settingsIdx - 1 + SETTINGS_SIZE) % SETTINGS_SIZE; break;
+        case STATE_TIMEOUT: {
+          int opts[] = {0,10,30,60,300};
+          int idx = 0; for (int i=0;i<5;i++) if (opts[i]==timeoutVal) idx=i;
+          idx = (idx - 1 + 5) % 5;
+          timeoutVal = opts[idx]; needRedraw = true; break;
         }
-        break;
-      case STATE_WIFI_ACTIONS:
-        wifiActionIdx = (wifiActionIdx + 1) % WIFI_ACTIONS_SIZE;
-        break;
-      case STATE_NRF24_MENU:
-        nrfMenuIdx = (nrfMenuIdx + 1) % NRF_MENU_SIZE;
-        break;
-      case STATE_IR_MENU:
-        irMenuIdx = (irMenuIdx + 1) % IR_MENU_SIZE;
-        break;
-      case STATE_IR_TRANSMIT:
-        irTxScroll = (irTxScroll + 1) % (IR_SLOTS_COUNT + 1);
-        break;
-      case STATE_SETTINGS_MENU:
-        settingsIdx = (settingsIdx + 1) % SETTINGS_SIZE;
-        break;
-      case STATE_TIMEOUT:
+        case STATE_TVBGONE: tvbgone_region = !tvbgone_region; delay(200); break;
+        case STATE_RESET_CONFIRM:
+          EEPROM.begin(EEPROM_SIZE_BYTES);
+          for (int i=0;i<EEPROM_SIZE_BYTES;i++) EEPROM.write(i,0xFF);
+          EEPROM.commit(); EEPROM.end(); delay(500); ESP.restart(); break;
+        case STATE_REBOOT_CONFIRM: ESP.restart(); break;
+        default: break;
+      }
+      delay(150);
+    }
+    if (down)
+    {
+      switch (appState)
       {
-        int opts[] = {0, 10, 30, 60, 300};
-        int idx = 0;
-        for (int i = 0; i < 5; i++) if (opts[i] == timeoutVal) idx = i;
-        idx = (idx + 1) % 5;
-        timeoutVal = opts[idx];
-        needRedraw = true;
-        break;
-      }
-      case STATE_TVBGONE:
-        tvbgone_region = !tvbgone_region;
-        delay(200);
-        break;
-      case STATE_RESET_CONFIRM:
-      case STATE_REBOOT_CONFIRM:
-        appState = STATE_SETTINGS_MENU;
-        needRedraw = true;
-        break;
-      default:
-        break;
-    }
-    delay(150);
-  }
-
-  // OK
-  if (ok)
-  {
-    switch (appState)
-    {
-      case STATE_MAIN_MENU:
-        switch (mainIdx)
-        {
-          case 0: appState = STATE_WIFI_MENU; wifiMenuIdx = 0; break;
-          case 1: appState = STATE_NRF24_MENU; nrfMenuIdx = 0; break;
-          case 2: appState = STATE_IR_MENU; irMenuIdx = 0; break;
-          case 3: appState = STATE_SETTINGS_MENU; settingsIdx = 0; break;
-        }
-        break;
-      case STATE_WIFI_MENU:
-        switch (wifiMenuIdx)
-        {
-          case 0:
-            startWifiScan();
-            appState = STATE_WIFI_SCAN;
-            break;
-          case 1:
-            wifiSpectrumActive = true;
-            totalPackets = 0;
-            memset(wifiPackets, 0, sizeof(wifiPackets));
-            memset(wifiSmooth, 0, sizeof(wifiSmooth));
-            currentWifiChan = 1;
-            esp_wifi_set_channel(currentWifiChan, WIFI_SECOND_CHAN_NONE);
-            esp_wifi_set_promiscuous(true);
-            esp_wifi_set_promiscuous_rx_cb([](void* buf, wifi_promiscuous_pkt_type_t type)
-            {
-              if (!wifiSpectrumActive) return;
-              wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
-              int ch = pkt->rx_ctrl.channel;
-              if (ch >= 1 && ch <= WIFI_CHANNELS) wifiPackets[ch]++;
-            });
-            appState = STATE_WIFI_SPECTRUM;
-            break;
-          case 2:
-            appState = STATE_MAIN_MENU;
-            break;
-        }
-        break;
-      case STATE_WIFI_SCAN:
-        if (!wifiScanning)
-        {
-          if (wifiSelectedIdx == -1) appState = STATE_WIFI_MENU;
-          else if (wifiSelectedIdx >= 0 && wifiSelectedIdx < (int)wifiList.size())
-            appState = STATE_WIFI_ACTIONS;
-        }
-        break;
-      case STATE_WIFI_ACTIONS:
-        switch (wifiActionIdx)
-        {
-          case 0: appState = STATE_WIFI_INFO; break;
-          case 1:
-            deauthActive = true;
-            memcpy(targetBSSID, wifiList[wifiSelectedIdx].bssid, 6);
-            targetChan = wifiList[wifiSelectedIdx].channel;
-            showMsg("Deauth started");
-            break;
-          case 2:
-            deauthActive = false;
-            targetChan = 0;
-            showMsg("Deauth stopped");
-            appState = STATE_WIFI_SCAN;
-            break;
-          case 3:
-            appState = STATE_WIFI_SCAN;
-            break;
-        }
-        break;
-      case STATE_WIFI_INFO:
-        appState = STATE_WIFI_ACTIONS;
-        break;
-      case STATE_WIFI_SPECTRUM:
-        wifiSpectrumActive = false;
-        esp_wifi_set_promiscuous(false);
-        WiFi.mode(WIFI_STA);
-        appState = STATE_WIFI_MENU;
-        break;
-      case STATE_NRF24_MENU:
-        switch (nrfMenuIdx)
-        {
-          case 0:
-            nrfCalibrated = false;
-            appState = STATE_NRF24_SPECTRUM;
-            break;
-          case 1:
-            if (nrfOk) appState = STATE_NRF24_JAMMER;
-            else showMsg(nrfErrorMsg.c_str());
-            break;
-          case 2:
-            recheckNRF24();
-            break;
-          case 3:
-            appState = STATE_MAIN_MENU;
-            break;
-        }
-        break;
-      case STATE_NRF24_SPECTRUM:
-        appState = STATE_NRF24_MENU;
-        break;
-      case STATE_NRF24_JAMMER:
-        if (!jamming && nrfOk) startJammer();
-        else if (jamming) { stopJammer(); appState = STATE_NRF24_MENU; }
-        break;
-      case STATE_IR_MENU:
-        switch (irMenuIdx)
-        {
-          case 0:
-            irCapturing = true;
-            irTempReady = false;
-            irTimeout = millis() + 15000;
-            if (irRx) irRx->resume();
-            appState = STATE_IR_CAPTURE;
-            break;
-          case 1:
-            irTxScroll = 0;
-            appState = STATE_IR_TRANSMIT;
-            break;
-          case 2:
-            eraseAllIrSlots();
-            appState = STATE_IR_MENU;
-            break;
-          case 3:
-            appState = STATE_TVBGONE;
-            break;
-          case 4:
-            appState = STATE_MAIN_MENU;
-            break;
-        }
-        break;
-      case STATE_IR_CAPTURE:
-        if (irTempReady)
-        {
-          int freeSlot = -1;
-          for (int i = 0; i < IR_SLOTS_COUNT; i++)
+        case STATE_MAIN_MENU: mainIdx = (mainIdx + 1) % MAIN_SIZE; break;
+        case STATE_WIFI_MENU: wifiMenuIdx = (wifiMenuIdx + 1) % WIFI_MENU_SIZE; break;
+        case STATE_WIFI_SCAN:
+          if (!wifiScanning)
           {
-            if (!irSlots[i].isValid) { freeSlot = i; break; }
+            int sz = wifiList.size();
+            if (wifiSelectedIdx == -1) { if (sz > 0) wifiSelectedIdx = 0; }
+            else { int newIdx = wifiSelectedIdx + 1; if (newIdx < sz) wifiSelectedIdx = newIdx; else if (newIdx == sz) wifiSelectedIdx = -1; }
           }
-          if (freeSlot == -1) freeSlot = curIrSlot;
-          curIrSlot = freeSlot;
-          irSlots[curIrSlot].rawLength = tempRawLen;
-          memcpy(irSlots[curIrSlot].rawBuffer, tempRaw, tempRawLen * 2);
-          irSlots[curIrSlot].protocolName = tempProto;
-          irSlots[curIrSlot].isValid = true;
-          saveIrSlots();
-          irTempReady = false;
+          break;
+        case STATE_WIFI_ACTIONS: wifiActionIdx = (wifiActionIdx + 1) % WIFI_ACTIONS_SIZE; break;
+        case STATE_NRF24_MENU: nrfMenuIdx = (nrfMenuIdx + 1) % NRF_MENU_SIZE; break;
+        case STATE_IR_MENU: irMenuIdx = (irMenuIdx + 1) % IR_MENU_SIZE; break;
+        case STATE_IR_TRANSMIT: irTxScroll = (irTxScroll + 1) % (IR_SLOTS_COUNT + 1); break;
+        case STATE_SETTINGS_MENU: settingsIdx = (settingsIdx + 1) % SETTINGS_SIZE; break;
+        case STATE_TIMEOUT: {
+          int opts[] = {0,10,30,60,300};
+          int idx = 0; for (int i=0;i<5;i++) if (opts[i]==timeoutVal) idx=i;
+          idx = (idx + 1) % 5;
+          timeoutVal = opts[idx]; needRedraw = true; break;
         }
-        appState = STATE_IR_MENU;
-        break;
-      case STATE_IR_TRANSMIT:
-        if (irTxScroll == IR_SLOTS_COUNT) appState = STATE_IR_MENU;
-        else if (irSlots[irTxScroll].isValid) sendIr(irTxScroll);
-        break;
-      case STATE_TVBGONE:
-        tvbgone_menu();
-        break;
-      case STATE_SETTINGS_MENU:
-        switch (settingsIdx)
-        {
-          case 0: appState = STATE_SYSTEM_INFO; break;
-          case 1: timeoutVal = displayTimeoutSec; appState = STATE_TIMEOUT; break;
-          case 2: appState = STATE_RESET_CONFIRM; break;
-          case 3: appState = STATE_REBOOT_CONFIRM; break;
-          case 4: appState = STATE_MAIN_MENU; break;
-        }
-        break;
-      case STATE_SYSTEM_INFO:
-        appState = STATE_SETTINGS_MENU;
-        break;
-      case STATE_TIMEOUT:
-        displayTimeoutSec = timeoutVal;
-        saveTimeout();
-        appState = STATE_SETTINGS_MENU;
-        break;
-      default:
-        break;
+        case STATE_TVBGONE: tvbgone_region = !tvbgone_region; delay(200); break;
+        case STATE_RESET_CONFIRM:
+        case STATE_REBOOT_CONFIRM: appState = STATE_SETTINGS_MENU; needRedraw = true; break;
+        default: break;
+      }
+      delay(150);
     }
-    delay(200);
+    if (ok)
+    {
+      switch (appState)
+      {
+        case STATE_MAIN_MENU:
+          switch (mainIdx)
+          {
+            case 0: appState = STATE_WIFI_MENU; wifiMenuIdx=0; break;
+            case 1: appState = STATE_NRF24_MENU; nrfMenuIdx=0; break;
+            case 2: appState = STATE_IR_MENU; irMenuIdx=0; break;
+            case 3: appState = STATE_CONSOLE; consoleMode=CONSOLE_KEYBOARD; selectedKey=0; capsLock=false; consoleText=""; drawKeyboard(); break;
+            case 4: appState = STATE_SETTINGS_MENU; settingsIdx=0; break;
+          }
+          break;
+        case STATE_WIFI_MENU:
+          switch (wifiMenuIdx)
+          {
+            case 0: startWifiScan(); appState = STATE_WIFI_SCAN; break;
+            case 1:
+              wifiSpectrumActive = true;
+              totalPackets=0;
+              memset(wifiPackets,0,sizeof(wifiPackets));
+              memset(wifiSmooth,0,sizeof(wifiSmooth));
+              currentWifiChan=1;
+              esp_wifi_set_channel(currentWifiChan, WIFI_SECOND_CHAN_NONE);
+              esp_wifi_set_promiscuous(true);
+              esp_wifi_set_promiscuous_rx_cb([](void* buf, wifi_promiscuous_pkt_type_t type){
+                if(!wifiSpectrumActive) return;
+                wifi_promiscuous_pkt_t* pkt=(wifi_promiscuous_pkt_t*)buf;
+                int ch=pkt->rx_ctrl.channel;
+                if(ch>=1 && ch<=WIFI_CHANNELS) wifiPackets[ch]++;
+              });
+              appState = STATE_WIFI_SPECTRUM;
+              break;
+            case 2: appState = STATE_MAIN_MENU; break;
+          }
+          break;
+        case STATE_WIFI_SCAN:
+          if(!wifiScanning)
+          {
+            if(wifiSelectedIdx==-1) appState=STATE_WIFI_MENU;
+            else if(wifiSelectedIdx>=0 && wifiSelectedIdx<(int)wifiList.size()) appState=STATE_WIFI_ACTIONS;
+          }
+          break;
+        case STATE_WIFI_ACTIONS:
+          switch(wifiActionIdx)
+          {
+            case 0: appState=STATE_WIFI_INFO; break;
+            case 1:
+              deauthActive=true;
+              memcpy(targetBSSID,wifiList[wifiSelectedIdx].bssid,6);
+              targetChan=wifiList[wifiSelectedIdx].channel;
+              showMsg("Deauth started");
+              break;
+            case 2:
+              deauthActive=false;
+              targetChan=0;
+              showMsg("Deauth stopped");
+              appState=STATE_WIFI_SCAN;
+              break;
+            case 3: appState=STATE_WIFI_SCAN; break;
+          }
+          break;
+        case STATE_WIFI_INFO: appState=STATE_WIFI_ACTIONS; break;
+        case STATE_WIFI_SPECTRUM:
+          wifiSpectrumActive=false;
+          esp_wifi_set_promiscuous(false);
+          WiFi.mode(WIFI_STA);
+          appState=STATE_WIFI_MENU;
+          break;
+        case STATE_NRF24_MENU:
+          switch(nrfMenuIdx)
+          {
+            case 0: nrfCalibrated=false; appState=STATE_NRF24_SPECTRUM; break;
+            case 1: if(nrfOk) appState=STATE_NRF24_JAMMER; else showMsg(nrfErrorMsg.c_str()); break;
+            case 2: recheckNRF24(); break;
+            case 3: appState=STATE_MAIN_MENU; break;
+          }
+          break;
+        case STATE_NRF24_SPECTRUM: appState=STATE_NRF24_MENU; break;
+        case STATE_NRF24_JAMMER:
+          if(!jamming && nrfOk) startJammer();
+          else if(jamming) { stopJammer(); appState=STATE_NRF24_MENU; }
+          break;
+        case STATE_IR_MENU:
+          switch(irMenuIdx)
+          {
+            case 0:
+              irCapturing=true;
+              irTempReady=false;
+              irTimeout=millis()+15000;
+              if(irRx) irRx->resume();
+              appState=STATE_IR_CAPTURE;
+              break;
+            case 1: irTxScroll=0; appState=STATE_IR_TRANSMIT; break;
+            case 2: eraseAllIrSlots(); appState=STATE_IR_MENU; break;
+            case 3: appState=STATE_TVBGONE; break;
+            case 4: appState=STATE_MAIN_MENU; break;
+          }
+          break;
+        case STATE_IR_CAPTURE:
+          if(irTempReady)
+          {
+            int freeSlot=-1;
+            for(int i=0;i<IR_SLOTS_COUNT;i++) if(!irSlots[i].isValid) { freeSlot=i; break; }
+            if(freeSlot==-1) freeSlot=curIrSlot;
+            curIrSlot=freeSlot;
+            irSlots[curIrSlot].rawLength=tempRawLen;
+            memcpy(irSlots[curIrSlot].rawBuffer,tempRaw,tempRawLen*2);
+            irSlots[curIrSlot].protocolName=tempProto;
+            irSlots[curIrSlot].isValid=true;
+            saveIrSlots();
+            irTempReady=false;
+          }
+          appState=STATE_IR_MENU;
+          break;
+        case STATE_IR_TRANSMIT:
+          if(irTxScroll==IR_SLOTS_COUNT) appState=STATE_IR_MENU;
+          else if(irSlots[irTxScroll].isValid) sendIr(irTxScroll);
+          break;
+        case STATE_TVBGONE: tvbgone_menu(); break;
+        case STATE_SETTINGS_MENU:
+          switch(settingsIdx)
+          {
+            case 0: appState=STATE_SYSTEM_INFO; break;
+            case 1: timeoutVal=displayTimeoutSec; appState=STATE_TIMEOUT; break;
+            case 2: appState=STATE_RESET_CONFIRM; break;
+            case 3: appState=STATE_REBOOT_CONFIRM; break;
+            case 4: appState=STATE_MAIN_MENU; break;
+          }
+          break;
+        case STATE_SYSTEM_INFO: appState=STATE_SETTINGS_MENU; break;
+        case STATE_TIMEOUT:
+          displayTimeoutSec=timeoutVal;
+          saveTimeout();
+          appState=STATE_SETTINGS_MENU;
+          break;
+        default: break;
+      }
+      delay(200);
+    }
   }
 
-  // Таймаут дисплея
   if (displayOn && displayTimeoutSec > 0 && (millis() - lastActivityTime) > (displayTimeoutSec * 1000UL))
-  {
     setPower(false);
-  }
 
-  // Фоновые задачи
   if (appState == STATE_WIFI_SPECTRUM && wifiSpectrumActive) updateWifiSpectrum();
   if (appState == STATE_NRF24_SPECTRUM && nrfOk) updateNrfSpectrum();
   if (appState == STATE_NRF24_JAMMER && jamming && nrfOk && millis() - lastJamTime > JAM_INTERVAL_MS) updateJammer();
