@@ -7,7 +7,7 @@
 ╚██████╗██║  ██║   ██║   ███████╗███████╗██║  ██║╚██████╔╝
  ╚═════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝╚══════╝╚═╝  ╚═╝ ╚═════╝
 ```
-Hello my name is Egor I'm 13 I live in Germany I created my new catZERO project on ESP32-C3.Based on this project, ESP32-C3 Super Mini is used,nrf24,Ir capture/transmit,oled display (128x64),3 clock buttons, 10 kOhm resistor, charging board, boost board from 3.7 to 5 Volts, 650 mah battery, breadboards (2x), wires.
+Hello my name is Egor I'm 13 I live in Germany I created my new catZERO project on ESP32-C3.Based on this project, ESP32-C3 Super Mini is used,nrf24,Ir capture/transmit,oled display (128x64),3 clock buttons, 2.2 kOhm resistor,3.3 kOhm resistor (2x),6.8 kOhm resistor charging board, boost board from 3.7 to 5 Volts, 650 mah battery, breadboards (2x), wires.I made some changes to the program and now there is an SD card lift.And now a control console has appeared there, but it is not quite completed.Due to a lack of pins for the SD card, we had to use a new technique for connecting clock buttons to the board.Now all the buttons are connected via resistors to one pin and everything works fine
 
 Connectio:
 
@@ -26,11 +26,17 @@ reset-10D
 
 buttons:
 
-up/left-20D
-
-ok-0D
-
-down/Right-1D
+3.3V
+ |
+[3.3k] ← tightening
+ |
+ +-------> GPIO0 (for testing; can be replaced later)
+ |
+ +--[2.2k]----Up button----GND
+ |
+ +--[3.3k]--Down Button-----GND
+ |
+ +--[6.8k]---OK button-------GND
 
 nrf24:
 
@@ -60,6 +66,20 @@ gnd-gnd
 
 vcc-21D
 
+mikro sd 
+
+gnd-gnd
+
+vcc-3.3v
+
+cs-20D
+
+mosi-7D
+
+miso-2D
+
+cls-6D
+
 CatHACK Features:
 
 WIFI:
@@ -86,6 +106,11 @@ Erase All
 
 TV-B-Gone
 
+console:
+
+As I already said, it will be possible to transport different teams there
+There is also a secret panel and you can change the code for it in the program
+
 Settings:
 
 info
@@ -98,4 +123,4 @@ Reboot
 
 That's all for now, now I'll sit and improve my code!!
 
-Guys, I was afraid of hate and that's why I renamed my project to catZero!!!
+(Guys, I was afraid of hate and that's why I renamed my project to catZero!!!)
