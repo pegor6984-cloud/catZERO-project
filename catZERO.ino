@@ -840,6 +840,9 @@ void showBootLogo() {
   display.setTextSize(2);
   display.setCursor(15, 25);
   display.println("catZERO");
+  display.setTextSize(1);
+  display.setCursor(15, 50);
+  display.println("by Egorus");
   display.display();
   delay(1000);
   display.setTextSize(1);
