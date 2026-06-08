@@ -854,7 +854,25 @@ void initSDCard() {
     display.setCursor(10, 28);
     display.println("SD Card failed!");
     display.display();
-    delay(2000);
+
+    // Ожидание двух быстрых нажатий OK для пропуска
+    unsigned long start = millis();
+    int clickCount = 0;
+    bool waitingForSecond = false;
+    while (millis() - start < 3000) { // ждём 3 секунды
+      if (btnOk()) {
+        clickCount++;
+        delay(200); // антидребезг
+        if (clickCount >= 2) {
+          break; // выходим из цикла, пропускаем задержку
+        }
+      }
+      delay(50);
+    }
+    // Если не было двух нажатий, показываем сообщение 2 секунды
+    if (clickCount < 2) {
+      delay(2000);
+    }
     return;
   }
   uint8_t cardType = SD.cardType();
