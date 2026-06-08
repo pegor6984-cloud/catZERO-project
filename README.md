@@ -9,6 +9,8 @@
 ```
 Hello my name is Egor I'm 13 I live in Germany I created my new catZERO project on ESP32-C3.Based on this project, ESP32-C3 Super Mini is used,nrf24,Ir capture/transmit,oled display (128x64),3 clock buttons, 2.2 kOhm resistor,3.3 kOhm resistor (2x),6.8 kOhm resistor charging board, boost board from 3.7 to 5 Volts, 650 mah battery, breadboards (2x), wires.I made some changes to the program and now there is an SD card lift.And now a control console has appeared there, but it is not quite completed.Due to a lack of pins for the SD card, we had to use a new technique for connecting clock buttons to the board.Now all the buttons are connected via resistors to one pin and everything works fine
 
+This code included an Internet connection and a beautiful Internet icon when connected to it
+
 Connectio:
 
 oled(128x64):
