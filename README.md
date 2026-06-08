@@ -27,6 +27,7 @@ reset-10D
 buttons:
 
 3.3V
+ 
  |
 
 [3.3k] ← tightening
