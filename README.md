@@ -101,6 +101,8 @@ Scan
 
 spectrum
 
+Wi-fi chat
+
 nRF24:
 
 Spectrum
