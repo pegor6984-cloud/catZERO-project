@@ -17,13 +17,19 @@ This code included an Internet connection and a beautiful Internet icon when con
 Connectio:
 
 rgd (Keyboard):
+
 vcc-5v
+
 gnd-gnd
+
 in-16
 
 rgb (BOARD):
+
 vcc-5v
+
 gnd-gnd
+
 in-14
 
 oled(128x64):
