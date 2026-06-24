@@ -12,6 +12,8 @@ Now a Wi-Fi chat has been added. If you are connected to Wi-Fi and you go to the
 Sorry for the fact that I was gone for so long the project has undergone very big changes now We have switched to a new processor Sorry that it is more expensive but now there are more functions We have switched to the ESP32 S3 Super Mini raft a new module has been added that's all CC1101 SD card module circuit diagrams I will now post and now a new command will appear firstly for CC1101 and working Bad USB scripts have appeared
 And now there are two new RGB LEDs, one we place under the keyboard, our navigation buttons, and the second I use as a piece of LED strip for eight RGB LEDs
 In the meantime, I’ve tried adding a lot of new things; first of all, I attempted to create an improved Deauther and Evil Portal.I also improved the jammer, but it still isn't working—even though I tried porting that function over from the Bruce firmware. Then I created a new "Apps" section; it now includes a calculator, two games, and Wikipedia. Now, when you connect to Wi-Fi, you can access Wikipedia, type in a question, and get an answer from the site. But in reality, everything else remains unchanged.
+I also spent a great deal of time working with a library U8g2 for Cyrillic support—since I’m from Ukraine, I’m familiar with Russian and other languages ​​that use the Cyrillic script. I tried to get two libraries working simultaneously: one handling rendering and the Wi-Fi chat, and another managing Wikipedia integration, so that Russian text could be displayed.
+But in the end, nothing worked out for me, so guys, I’m really asking for your help.
 
 This code included an Internet connection and a beautiful Internet icon when connected to it
 
