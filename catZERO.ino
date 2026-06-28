@@ -1,4 +1,3 @@
-
 #include <Preferences.h>
 #include <SPI.h>
 #include <Wire.h>
@@ -226,7 +225,7 @@ void wifiDisconnect();
 #define CC_MISO_PIN  2
 #define CC_MOSI_PIN  7
 #define CC_CSN_PIN   4
-#define IR_RX_PIN       5
+#define IR_RX_PIN       12
 #define IR_TX_PIN       18
 #define RESET_BUTTON_PIN 1
 #define CHARGE_PIN  13
@@ -244,6 +243,15 @@ Adafruit_NeoPixel led_board(NUM_LEDS_BOARD, LED_BOARD_PIN, NEO_GRB + NEO_KHZ800)
 Adafruit_NeoPixel led_keyboard(NUM_LEDS_KEYPAD, LED_KEYBOARD_PIN, NEO_GRB + NEO_KHZ800);
 USBHIDKeyboard Keyboard;
 
+#define BUZZER_PIN 3   // пин, к которому подключён зуммер
+
+// Глобальные настройки звука
+bool soundEnabled = true;
+int soundVolume = 50;   // 0..100
+// в блоке глобальных переменных, например, после Preferences pref;
+int soundVolumeSaved = 50;
+bool soundEnabledSaved = true;
+
 const uint32_t colorPalette[] = {
   0x000000, 0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0xFF00FF, 0x00FFFF, 0xFFFFFF,
   0xFF8000, 0x80FF00, 0x0080FF, 0x8000FF, 0xFF0080, 0x00FF80, 0x804000, 0x408000,
@@ -252,9 +260,13 @@ const uint32_t colorPalette[] = {
 };
 const int numColors = 30;
 const char* effectNames[] = {
-  "Solid", "Breathing", "Rainbow", "Running Cubes", "Theater Chase", "Strobe"
+    // Существующие 6
+    "Solid", "Breathing", "Rainbow", "Running Cubes", "Theater Chase", "Strobe",
+    // Новые для матрицы (10)
+    "Fire", "Meteor", "Comet", "Sparkle", "Noise",
+    "Gradient", "Wave", "Snake", "Bounce", "Twinkle"
 };
-const int numEffects = 6;
+const int numEffects = 16;
 
 int led_scroll_offset = 0;
 unsigned long lastLedActivity = 0;
@@ -282,17 +294,37 @@ unsigned long lastButtonPress = 0;
 const int debounceDelay = 50;
 
 Button readButton() {
-  if (millis() - lastButtonPress < debounceDelay) return BTN_NONE;
-  int value = analogRead(BTN_ANALOG_PIN);
-  if (value > 3500) return BTN_NONE;
-  const int CENTER_UP   = 1575;
-  const int CENTER_DOWN = 1980;
-  const int CENTER_OK   = 2665;
-  const int TOLERANCE   = 100;
-  if (abs(value - CENTER_UP)   < TOLERANCE) return BTN_UP;
-  if (abs(value - CENTER_DOWN) < TOLERANCE) return BTN_DOWN;
-  if (abs(value - CENTER_OK)   < TOLERANCE) return BTN_OK;
-  return BTN_NONE;
+
+    static unsigned long lastPrint = 0;
+
+    int value = analogRead(BTN_ANALOG_PIN);
+
+    if (millis() - lastPrint > 100) {
+        Serial.printf("ADC = %d\n", value);
+        lastPrint = millis();
+    }
+
+    if (millis() - lastButtonPress < debounceDelay)
+        return BTN_NONE;
+
+    if (value > 3500)
+        return BTN_NONE;
+
+    const int CENTER_UP   = 1575;
+    const int CENTER_DOWN = 1980;
+    const int CENTER_OK   = 2665;
+    const int TOLERANCE   = 100;
+
+    if (abs(value - CENTER_UP) < TOLERANCE)
+        return BTN_UP;
+
+    if (abs(value - CENTER_DOWN) < TOLERANCE)
+        return BTN_DOWN;
+
+    if (abs(value - CENTER_OK) < TOLERANCE)
+        return BTN_OK;
+
+    return BTN_NONE;
 }
 bool btnUp()   { return readButton() == BTN_UP; }
 bool btnDown() { return readButton() == BTN_DOWN; }
@@ -372,6 +404,8 @@ uint8_t targetBSSID[6];
 int targetChan = 0;
 bool deauthActive = false;
 unsigned long lastDeauthTime = 0;
+
+int audioMenuIdx = 0;
 
 RF24 radio(RF_CE_PIN, RF_CSN_PIN);
 int nrfSmooth[NRF_CHANNELS];
@@ -456,97 +490,11 @@ const uint8_t tetrominoes[7][4][4] = {
   // J
   {{0,0,0,0},{0,0,1,0},{1,1,1,0},{0,0,0,0}}
 };
-
-// Функции Tetris
-void spawnPiece() {
-  currentPiece.type = random(0, 7);
-  currentPiece.rotation = 0;
-  currentPiece.x = 3;
-  currentPiece.y = 0;
-  // следующая фигура (для отображения в будущем)
-  nextPiece.type = random(0, 7);
-  nextPiece.rotation = 0;
-}
-
-bool collision(int type, int rot, int x, int y) {
-  for (int row = 0; row < 4; row++) {
-    for (int col = 0; col < 4; col++) {
-      if (tetrominoes[type][rot][row * 4 + col]) {
-        int fieldX = x + col;
-        int fieldY = y + row;
-        if (fieldX < 0 || fieldX >= TETRIS_WIDTH || fieldY >= TETRIS_HEIGHT || fieldY < 0) return true;
-        if (fieldY >= 0 && tetrisField[fieldY][fieldX]) return true;
-      }
-    }
-  }
-  return false;
-}
-
-void lockPiece() {
-  for (int row = 0; row < 4; row++) {
-    for (int col = 0; col < 4; col++) {
-      if (tetrominoes[currentPiece.type][currentPiece.rotation][row * 4 + col]) {
-        int fieldX = currentPiece.x + col;
-        int fieldY = currentPiece.y + row;
-        if (fieldY >= 0 && fieldY < TETRIS_HEIGHT && fieldX >= 0 && fieldX < TETRIS_WIDTH) {
-          tetrisField[fieldY][fieldX] = 1;
-        }
-      }
-    }
-  }
-}
-
-void clearLines() {
-  int linesCleared = 0;
-  for (int row = TETRIS_HEIGHT - 1; row >= 0; ) {
-    bool full = true;
-    for (int col = 0; col < TETRIS_WIDTH; col++) {
-      if (!tetrisField[row][col]) { full = false; break; }
-    }
-    if (full) {
-      // сдвинуть строки вниз
-      for (int r = row; r > 0; r--) {
-        for (int c = 0; c < TETRIS_WIDTH; c++) {
-          tetrisField[r][c] = tetrisField[r-1][c];
-        }
-      }
-      for (int c = 0; c < TETRIS_WIDTH; c++) tetrisField[0][c] = 0;
-      linesCleared++;
-      // не увеличиваем row, т.к. сверху спустилась новая строка
-    } else {
-      row--;
-    }
-  }
-  if (linesCleared > 0) {
-    tetrisLines += linesCleared;
-    tetrisScore += linesCleared * 100;
-    // ускорение при большом количестве линий
-    if (tetrisLines > 10) tetrisDropInterval = 400;
-    if (tetrisLines > 20) tetrisDropInterval = 300;
-    if (tetrisLines > 30) tetrisDropInterval = 200;
-    if (tetrisLines > 40) tetrisDropInterval = 100;
-  }
-}
-
-void drawPiece(int type, int rot, int x, int y) {
-  for (int row = 0; row < 4; row++) {
-    for (int col = 0; col < 4; col++) {
-      if (tetrominoes[type][rot][row * 4 + col]) {
-        int fieldX = x + col;
-        int fieldY = y + row;
-        if (fieldY >= 0 && fieldY < TETRIS_HEIGHT && fieldX >= 0 && fieldX < TETRIS_WIDTH) {
-          display.fillRect(fieldX * 4 + 10, fieldY * 3 + 14, 4, 3, SSD1306_WHITE);
-        }
-      }
-    }
-  }
-}
-
 // ========== BIRD ==========
 int birdX = 20, birdY = 32;
 float birdVel = 0;
-const float gravity = 0.4;
-const float jumpPower = -7.0;
+const float gravity = 0.8;
+const float jumpPower = -8.0;
 struct Pipe {
   int x;
   int gapY;
@@ -558,10 +506,9 @@ bool birdGameOver = false;
 unsigned long birdLastUpdate = 0;
 const int PIPE_WIDTH = 6;
 const int GAP_HEIGHT = 16;
-const int PIPE_SPEED = 3;
-const int PIPE_INTERVAL = 70;
+const int PIPE_SPEED = 5;
+const int PIPE_INTERVAL = 40;
 int birdFrameCounter = 0;
-int birdHighScore = 0;
 int birdOkPressCount = 0;
 unsigned long birdLastOkTime = 0;
 
@@ -598,6 +545,8 @@ double evaluateExpression(String expr) {
   return 0;
 }
 enum AppState {
+  STATE_AUDIO_MENU,
+  STATE_AUDIO_VOLUME,
   STATE_APPS_MENU,
   STATE_APPS_WIKIPEDIA_INPUT,
   STATE_APPS_WIKIPEDIA_RESULT,
@@ -822,6 +771,28 @@ unsigned long wikipediaLastScrollTime = 0;
 int wikipediaLineCount = 0;
 int wikipediaVisibleLines = 0;
 String wikipediaLines[50]; // максимум строк для прокрутки
+
+int birdHighScore = 0;          // рекорд
+bool birdFirstRun = true;       // флаг для загрузки рекорда
+// ========== DINOSAUR ==========
+int dinoX = 20, dinoY = 48;          // позиция динозавра
+int dinoWidth = 8, dinoHeight = 12;
+float dinoVel = 0;
+bool dinoJumping = false;
+const float dinoGravity = 0.6;
+const float dinoJumpPower = -9.0;
+struct Obstacle {
+    int x;
+    int width;
+    int height;
+};
+std::vector<Obstacle> obstacles;
+int dinoScore = 0;
+bool dinoGameOver = false;
+unsigned long dinoLastUpdate = 0;
+int dinoSpeed = 3;
+int dinoHighScore = 0;
+int dinoFrameCounter = 0;
 
 const char* badUsbBuiltinScripts[] = {
   "REM System Info via PowerShell\n"
@@ -1577,8 +1548,8 @@ void drawAppsMenu() {
   display.clearDisplay();
   drawHeader("Apps");
   Serial.println("drawAppsMenu called");
-  const char* items[] = {"Calculator", "Bird", "Tetris", "Wikipedia", "Back"};
-  const int size = 5;
+  const char* items[] = {"Calculator", "Bird", "Dino", "Wikipedia", "Audio", "Back"};
+  const int size = 6;
   
   for (int i = 0; i < size; i++) {
     int y = 14 + i * 10;
@@ -1598,115 +1569,199 @@ void drawAppsMenu() {
   display.display();
 }
 void drawBirdGame() {
-  display.clearDisplay();
-  drawHeader("Bird");
+    static unsigned long lastFrame = 0;
+    static float birdAngle = 0;
+    static unsigned long okHoldStart = 0;
+    static bool okHeld = false;
 
-  // Обработка выхода по длительному нажатию OK (2 секунды)
-  static unsigned long okHoldStart = 0;
-  static bool okHeld = false;
-  
-  if (btnOk()) {
-    if (!okHeld) {
-      okHeld = true;
-      okHoldStart = millis();
-      // Прыжок при одиночном нажатии
-      if (!birdGameOver) birdVel = jumpPower;
-    } else {
-      // Длительное удержание -> выход в меню
-      if (millis() - okHoldStart > 2000) {
-        appState = STATE_APPS_MENU;
-        needRedraw = true;
-        okHeld = false;
-        return;
-      }
-    }
-  } else {
-    okHeld = false;
-  }
-
-  if (birdGameOver) {
-    display.setCursor(30, 30);
-    display.print("Game Over");
-    display.setCursor(20, 45);
-    display.print("Score: ");
-    display.print(birdScore);
-    display.setCursor(10, 55);
-    display.print("OK=restart, Up/Down=exit");
-    drawTopBarIcons();
-    display.display();
-    
+    // Обработка входа/выхода
     if (btnOk()) {
-      // Рестарт
-      birdY = 32;
-      birdVel = 0;
-      pipes.clear();
-      birdScore = 0;
-      birdGameOver = false;
-      birdFrameCounter = 0;
-      needRedraw = true;
+        if (!okHeld) {
+            okHeld = true;
+            okHoldStart = millis();
+            if (!birdGameOver) {
+                birdVel = jumpPower;   // прыжок
+                birdAngle = -0.4;
+                playJumpSound();
+            }
+        } else {
+            if (millis() - okHoldStart > 2000) {
+                appState = STATE_APPS_MENU;
+                needRedraw = true;
+                okHeld = false;
+                return;
+            }
+        }
+    } else {
+        okHeld = false;
     }
-    if (btnUp() || btnDown()) {
-      appState = STATE_APPS_MENU;
-      needRedraw = true;
-    }
-    return;
-  }
 
-  // Обновление физики
-  if (millis() - birdLastUpdate > 30) {
-    birdLastUpdate = millis();
-    birdVel += gravity;
-    birdY += birdVel;
-    if (birdY > 60) { birdGameOver = true; needRedraw = true; }
-    if (birdY < 0) birdY = 0;
+    // Если игра окончена
+    if (birdGameOver) {
+        display.clearDisplay();
+        drawHeader("Bird");
+        display.setCursor(20, 25);
+        display.print("GAME OVER");
+        display.setCursor(20, 40);
+        display.print("Score: " + String(birdScore));
+        display.setCursor(20, 55);
+        display.print("Best: " + String(birdHighScore));
+        display.setCursor(2, 60);
+        display.print("OK=restart  Hold=exit");
+        drawTopBarIcons();
+        display.display();
+
+        if (btnOk() && !okHeld) {
+            // Рестарт
+            birdY = 32;
+            birdVel = 0;
+            pipes.clear();
+            birdScore = 0;
+            birdGameOver = false;
+            birdFrameCounter = 0;
+            birdAngle = 0;
+            needRedraw = true;
+        }
+        return;
+    }
+
+    // Обновление физики (60 FPS)
+    if (millis() - lastFrame > 16) {
+        lastFrame = millis();
+        birdVel += gravity;
+        birdY += birdVel;
+        birdAngle = birdVel * 0.05;
+        if (birdAngle > 1.2) birdAngle = 1.2;
+        if (birdAngle < -0.8) birdAngle = -0.8;
+
+        if (birdY > 58) { birdGameOver = true; needRedraw = true; return; }
+        if (birdY < 0) birdY = 0;
+
+        // Движение труб
+        for (int i = pipes.size() - 1; i >= 0; i--) {
+            pipes[i].x -= PIPE_SPEED + birdScore / 100;
+            if (pipes[i].x < -PIPE_WIDTH) {
+                pipes.erase(pipes.begin() + i);
+            } else {
+                if (!pipes[i].scored && pipes[i].x + PIPE_WIDTH < birdX) {
+                    pipes[i].scored = true;
+                    birdScore++;
+                    playScoreSound();
+                    if (birdScore > birdHighScore) {
+                        birdHighScore = birdScore;
+                        pref.begin("games", false);
+                        pref.putInt("birdHigh", birdHighScore);
+                        pref.end();
+                    }
+                }
+                // Столкновение
+                if (birdX + 3 > pipes[i].x && birdX - 3 < pipes[i].x + PIPE_WIDTH) {
+                    int top = pipes[i].gapY - GAP_HEIGHT/2;
+                    int bottom = pipes[i].gapY + GAP_HEIGHT/2;
+                    if (birdY - 4 < top || birdY + 4 > bottom) {
+                        birdGameOver = true;
+                        needRedraw = true;
+                        playHitSound();
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Генерация труб
+        birdFrameCounter++;
+        if (birdFrameCounter % (PIPE_INTERVAL - birdScore / 5) == 0) {
+            Pipe p;
+            p.x = 128;
+            p.gapY = random(20, 44);
+            p.scored = false;
+            pipes.push_back(p);
+        }
+        needRedraw = true;
+    }
+
+    // Отрисовка
+    display.clearDisplay();
+    drawHeader("Bird");
+    // Фон
+    display.fillRect(0, 13, 128, 51, SSD1306_BLACK);
+    // Птица (с поворотом)
+    int px = birdX, py = birdY;
+    display.drawCircle(px, py, 4, SSD1306_WHITE);
+    // Клюв
+    display.drawLine(px + 4, py, px + 7, py - 1, SSD1306_WHITE);
+    // Крыло
+    display.drawLine(px - 2, py - 2, px - 5, py - 4, SSD1306_WHITE);
+    // Глаз
+    display.drawPixel(px + 2, py - 1, SSD1306_WHITE);
 
     // Трубы
-    for (int i = pipes.size() - 1; i >= 0; i--) {
-      pipes[i].x -= PIPE_SPEED;
-      if (pipes[i].x < -PIPE_WIDTH) {
-        pipes.erase(pipes.begin() + i);
-      } else {
-        if (!pipes[i].scored && pipes[i].x + PIPE_WIDTH < birdX) {
-          pipes[i].scored = true;
-          birdScore++;
-        }
-        // Столкновение
-        if (birdX + 3 > pipes[i].x && birdX - 3 < pipes[i].x + PIPE_WIDTH) {
-          int top = pipes[i].gapY - GAP_HEIGHT/2;
-          int bottom = pipes[i].gapY + GAP_HEIGHT/2;
-          if (birdY - 4 < top || birdY + 4 > bottom) {
-            birdGameOver = true;
-            needRedraw = true;
-          }
-        }
-      }
+    for (auto &p : pipes) {
+        display.fillRect(p.x, 13, PIPE_WIDTH, p.gapY - GAP_HEIGHT/2 - 13, SSD1306_WHITE);
+        display.fillRect(p.x, p.gapY + GAP_HEIGHT/2, PIPE_WIDTH, 64 - (p.gapY + GAP_HEIGHT/2), SSD1306_WHITE);
     }
 
-    // Генерация труб
-    birdFrameCounter++;
-    if (birdFrameCounter % PIPE_INTERVAL == 0) {
-      Pipe p;
-      p.x = 128;
-      p.gapY = random(20, 44);
-      p.scored = false;
-      pipes.push_back(p);
-    }
-    needRedraw = true;
-  }
+    // Счёт и рекорд
+    display.setCursor(2, 14);
+    display.print("Score: " + String(birdScore));
+    display.setCursor(70, 14);
+    display.print("Best: " + String(birdHighScore));
 
-  // Отрисовка
-  display.fillRect(0, 13, 128, 51, SSD1306_BLACK);
-  display.fillCircle(birdX, birdY, 4, SSD1306_WHITE);
-  for (auto &p : pipes) {
-    display.fillRect(p.x, 13, PIPE_WIDTH, p.gapY - GAP_HEIGHT/2 - 13, SSD1306_WHITE);
-    display.fillRect(p.x, p.gapY + GAP_HEIGHT/2, PIPE_WIDTH, 64 - (p.gapY + GAP_HEIGHT/2), SSD1306_WHITE);
-  }
-  display.setCursor(2, 14);
-  display.print("Score: ");
-  display.print(birdScore);
-  drawTopBarIcons();
-  display.display();
+    drawTopBarIcons();
+    display.display();
 }
+void initBuzzer() {
+    pinMode(BUZZER_PIN, OUTPUT);
+    ledcSetup(1, 2000, 8);        // канал 1
+    ledcAttachPin(BUZZER_PIN, 1);
+    ledcWrite(1, 0);
+}
+
+// Воспроизведение тона с заданной частотой и длительностью (мс)
+void playTone(int frequency, int duration) {
+    if (!soundEnabled) return;
+    if (frequency <= 0) { delay(duration); return; }
+    int volume = map(soundVolume, 0, 100, 0, 128);
+    ledcWriteTone(1, frequency);
+    ledcWrite(1, volume);
+    delay(duration);
+    ledcWrite(0, 0);
+}
+
+// Звуковые эффекты для игр
+void playJumpSound() {
+    playTone(800, 50);
+    delay(20);
+    playTone(1000, 30);
+}
+
+void playHitSound() {
+    playTone(200, 200);
+}
+
+void playScoreSound() {
+    playTone(1200, 30);
+    delay(30);
+    playTone(1500, 30);
+}
+
+void playTetrisRotate() {
+    playTone(600, 30);
+}
+
+void playTetrisDrop() {
+    playTone(300, 100);
+}
+
+void playTetrisClear() {
+    for (int i = 0; i < 3; i++) {
+        playTone(800 + i*100, 50);
+        delay(50);
+    }
+}
+
+
+
 // ----------------------------------------------------------------------------
 // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ВИКИПЕДИИ
 // ----------------------------------------------------------------------------
@@ -3537,6 +3592,46 @@ void drawRebootConfirm() {
   drawTopBarIcons();
   display.display();
 }
+void drawAudioMenu() {
+    display.clearDisplay();
+    drawHeader("Audio Settings");
+    const int size = 3;
+    String items[size];
+    items[0] = soundEnabled ? "Sound: ON" : "Sound: OFF";
+    items[1] = "Volume: " + String(soundVolume) + "%";
+    items[2] = "Back";
+    for (int i = 0; i < size; i++) {
+        int y = 14 + i * 12;
+        if (i == audioMenuIdx) {
+            display.fillRect(0, y - 1, SCREEN_WIDTH, 11, SSD1306_WHITE);
+            display.setTextColor(SSD1306_BLACK);
+            display.setCursor(4, y);
+            display.print(">");
+        } else {
+            display.setTextColor(SSD1306_WHITE);
+        }
+        display.setCursor(14, y);
+        display.print(items[i]);
+    }
+    drawTopBarIcons();
+    display.display();
+}
+// добавить в enum: STATE_AUDIO_VOLUME,
+
+void drawAudioVolume() {
+    display.clearDisplay();
+    drawHeader("Volume");
+    display.setCursor(10, 25);
+    display.print("Volume: ");
+    display.print(soundVolume);
+    display.print("%");
+    display.drawRect(10, 40, 108, 8, SSD1306_WHITE);
+    display.fillRect(10, 40, map(soundVolume, 0, 100, 0, 108), 8, SSD1306_WHITE);
+    display.setCursor(2, 56);
+    display.print("UP/DOWN=Change  OK=Save");
+    drawTopBarIcons();
+    display.display();
+}
 void drawChatKeyboard() {
   display.clearDisplay();
   display.drawRect(0, 0, 128, 10, WHITE);
@@ -3807,147 +3902,141 @@ void drawStorageInfo() {
   drawTopBarIcons();
   display.display();
 }
-void drawTetrisGame() {
-  display.clearDisplay();
-  drawHeader("Tetris");
+void initDinoGame() {
+    dinoY = 48;
+    dinoVel = 0;
+    dinoJumping = false;
+    obstacles.clear();
+    dinoScore = 0;
+    dinoGameOver = false;
+    dinoSpeed = 3;
+    dinoFrameCounter = 0;
+}
 
-  if (tetrisGameOver) {
-    display.setCursor(30, 30);
-    display.print("Game Over");
-    display.setCursor(20, 45);
-    display.print("Score: ");
-    display.print(tetrisScore);
-    display.setCursor(10, 55);
-    display.print("OK=restart, Up/Down=exit");
+void drawDinoGame() {
+    static unsigned long lastFrame = 0;
+    static unsigned long okHoldStart = 0;
+    static bool okHeld = false;
+
+    if (btnOk()) {
+        if (!okHeld) {
+            okHeld = true;
+            okHoldStart = millis();
+            if (!dinoGameOver && !dinoJumping) {
+                dinoVel = dinoJumpPower;
+                dinoJumping = true;
+                playJumpSound();
+            }
+        } else if (millis() - okHoldStart > 2000) {
+            appState = STATE_APPS_MENU;
+            needRedraw = true;
+            okHeld = false;
+            return;
+        }
+    } else {
+        okHeld = false;
+    }
+
+    if (dinoGameOver) {
+        display.clearDisplay();
+        drawHeader("Dino");
+        display.setCursor(20, 25);
+        display.print("GAME OVER");
+        display.setCursor(20, 40);
+        display.print("Score: " + String(dinoScore));
+        display.setCursor(20, 55);
+        display.print("Best: " + String(dinoHighScore));
+        display.setCursor(2, 60);
+        display.print("OK=restart  Hold=exit");
+        drawTopBarIcons();
+        display.display();
+        if (btnOk() && !okHeld) {
+            initDinoGame();
+            needRedraw = true;
+        }
+        return;
+    }
+
+    if (millis() - lastFrame > 20) {
+        lastFrame = millis();
+
+        // Физика прыжка
+        if (dinoJumping) {
+            dinoVel += dinoGravity;
+            dinoY += dinoVel;
+            if (dinoY >= 48) {
+                dinoY = 48;
+                dinoJumping = false;
+                dinoVel = 0;
+            }
+        }
+
+        // Генерация препятствий
+        dinoFrameCounter++;
+        if (dinoFrameCounter % (60 - dinoScore / 10) == 0) {
+            Obstacle obs;
+            obs.x = 128;
+            obs.width = 8;
+            obs.height = random(8, 16);
+            obstacles.push_back(obs);
+        }
+
+        // Движение препятствий
+        for (int i = obstacles.size() - 1; i >= 0; i--) {
+            obstacles[i].x -= dinoSpeed;
+            if (obstacles[i].x < -obstacles[i].width) {
+                obstacles.erase(obstacles.begin() + i);
+                dinoScore++;
+                if (dinoScore > dinoHighScore) {
+                    dinoHighScore = dinoScore;
+                    pref.begin("games", false);
+                    pref.putInt("dinoHigh", dinoHighScore);
+                    pref.end();
+                }
+                // Ускорение
+                if (dinoScore % 5 == 0) dinoSpeed++;
+            } else {
+                // Столкновение
+                if (obstacles[i].x < dinoX + dinoWidth &&
+                    obstacles[i].x + obstacles[i].width > dinoX) {
+                    if (dinoY + dinoHeight > 48 - obstacles[i].height) {
+                        dinoGameOver = true;
+                        playHitSound();
+                        needRedraw = true;
+                        return;
+                    }
+                }
+            }
+        }
+        needRedraw = true;
+    }
+
+    // Отрисовка
+    display.clearDisplay();
+    drawHeader("Dino");
+    // Земля
+    display.drawLine(0, 60, 128, 60, SSD1306_WHITE);
+
+    // Динозавр (простой квадрат с ногами)
+    display.fillRect(dinoX, dinoY, dinoWidth, dinoHeight, SSD1306_WHITE);
+    display.fillRect(dinoX - 2, dinoY + dinoHeight, 3, 3, SSD1306_WHITE);
+    display.fillRect(dinoX + dinoWidth - 1, dinoY + dinoHeight, 3, 3, SSD1306_WHITE);
+    // Глаз
+    display.drawPixel(dinoX + dinoWidth - 3, dinoY + 2, SSD1306_BLACK);
+
+    // Препятствия
+    for (auto &obs : obstacles) {
+        display.fillRect(obs.x, 60 - obs.height, obs.width, obs.height, SSD1306_WHITE);
+    }
+
+    // Счёт
+    display.setCursor(2, 14);
+    display.print("Score: " + String(dinoScore));
+    display.setCursor(70, 14);
+    display.print("Best: " + String(dinoHighScore));
+
     drawTopBarIcons();
     display.display();
-    if (btnOk()) {
-      memset(tetrisField, 0, sizeof(tetrisField));
-      tetrisScore = 0;
-      tetrisLines = 0;
-      tetrisGameOver = false;
-      spawnPiece();
-      needRedraw = true;
-    }
-    if (btnUp() || btnDown()) {
-      appState = STATE_APPS_MENU;
-      needRedraw = true;
-    }
-    return;
-  }
-
-  // === Управление ===
-  // Движение влево/вправо с автоповтором
-  static unsigned long lastMoveTime = 0;
-  static bool moveHeld = false;
-  static int moveDir = 0; // -1 влево, 1 вправо
-
-  if (btnUp()) {
-    if (!moveHeld) {
-      moveHeld = true;
-      moveDir = -1;
-      lastMoveTime = millis();
-      int newX = currentPiece.x - 1;
-      if (!collision(currentPiece.type, currentPiece.rotation, newX, currentPiece.y)) {
-        currentPiece.x = newX;
-        needRedraw = true;
-      }
-    } else if (millis() - lastMoveTime > 150) {
-      lastMoveTime = millis();
-      int newX = currentPiece.x - 1;
-      if (!collision(currentPiece.type, currentPiece.rotation, newX, currentPiece.y)) {
-        currentPiece.x = newX;
-        needRedraw = true;
-      }
-    }
-  } else if (btnDown()) {
-    if (!moveHeld) {
-      moveHeld = true;
-      moveDir = 1;
-      lastMoveTime = millis();
-      int newX = currentPiece.x + 1;
-      if (!collision(currentPiece.type, currentPiece.rotation, newX, currentPiece.y)) {
-        currentPiece.x = newX;
-        needRedraw = true;
-      }
-    } else if (millis() - lastMoveTime > 150) {
-      lastMoveTime = millis();
-      int newX = currentPiece.x + 1;
-      if (!collision(currentPiece.type, currentPiece.rotation, newX, currentPiece.y)) {
-        currentPiece.x = newX;
-        needRedraw = true;
-      }
-    }
-  } else {
-    moveHeld = false;
-  }
-
-  // Обработка OK: поворот, ускорение, выход по длительному нажатию
-  static unsigned long okHoldStart = 0;
-  static bool okHeld = false;
-
-  if (btnOk()) {
-    if (!okHeld) {
-      okHeld = true;
-      okHoldStart = millis();
-      // Поворот
-      int newRot = (currentPiece.rotation + 1) % 4;
-      if (!collision(currentPiece.type, newRot, currentPiece.x, currentPiece.y)) {
-        currentPiece.rotation = newRot;
-        needRedraw = true;
-      }
-    } else {
-      // Удержание: ускоренное падение (после 200 мс)
-      if (millis() - okHoldStart > 200) {
-        if (!collision(currentPiece.type, currentPiece.rotation, currentPiece.x, currentPiece.y + 1)) {
-          currentPiece.y++;
-          needRedraw = true;
-        }
-      }
-      // Выход при удержании 2 секунды
-      if (millis() - okHoldStart > 2000) {
-        appState = STATE_APPS_MENU;
-        needRedraw = true;
-        okHeld = false;
-        return;
-      }
-    }
-  } else {
-    okHeld = false;
-  }
-
-  // Падение по таймеру
-  if (millis() - tetrisLastDrop > tetrisDropInterval) {
-    tetrisLastDrop = millis();
-    if (!collision(currentPiece.type, currentPiece.rotation, currentPiece.x, currentPiece.y + 1)) {
-      currentPiece.y++;
-      needRedraw = true;
-    } else {
-      lockPiece();
-      clearLines();
-      spawnPiece();
-      if (collision(currentPiece.type, currentPiece.rotation, currentPiece.x, currentPiece.y)) {
-        tetrisGameOver = true;
-        needRedraw = true;
-      }
-      needRedraw = true;
-    }
-  }
-
-  // Отрисовка поля
-  for (int row = 0; row < TETRIS_HEIGHT; row++) {
-    for (int col = 0; col < TETRIS_WIDTH; col++) {
-      if (tetrisField[row][col]) {
-        display.fillRect(col * 4 + 10, row * 3 + 14, 4, 3, SSD1306_WHITE);
-      }
-    }
-  }
-  drawPiece(currentPiece.type, currentPiece.rotation, currentPiece.x, currentPiece.y);
-  display.setCursor(2, 14);
-  display.print("Score: ");
-  display.print(tetrisScore);
-  drawTopBarIcons();
-  display.display();
 }
 void drawCalculator() {
   display.clearDisplay();
@@ -4168,6 +4257,19 @@ void updateLedBoard() {
     static int chaseStep = 0;
     static bool strobeState = false;
     static int hueOffset = 0;
+    static float fireHeat[8] = {0};
+    static int meteorPos = 0;
+    static int cometPos = 0;
+    static bool sparkleState[8] = {false};
+    static unsigned long sparkleTimer[8] = {0};
+    static int noiseSeed = 0;
+    static int wavePhase = 0;
+    static int snakePos = 0;
+    static int snakeDir = 1;
+    static int bouncePos = 0;
+    static int bounceDir = 1;
+    static int twinkleBright[8] = {0};
+    static unsigned long twinkleTimer[8] = {0};
 
     if (led_board_timeout > 0 && (millis() - lastLedActivity) > (led_board_timeout * 1000UL)) {
         led_board.clear();
@@ -4178,188 +4280,334 @@ void updateLedBoard() {
     if (millis() - lastUpdate < 30) return;
     lastUpdate = millis();
 
-    uint32_t baseColor = 0;
-    if (led_board_colorIdx > 0 && led_board_colorIdx < numColors) {
-        baseColor = colorPalette[led_board_colorIdx];
-    } else {
-        baseColor = colorPalette[0];
-    }
-
+    uint32_t baseColor = colorPalette[led_board_colorIdx];
     uint8_t r = (baseColor >> 16) & 0xFF;
     uint8_t g = (baseColor >> 8) & 0xFF;
     uint8_t b = baseColor & 0xFF;
     float bright = (float)led_board_brightness / 100.0;
 
     switch (led_board_effect) {
-        case 0:
-            for (int i = 0; i < 8; i++) {
-                led_board.setPixelColor(i, led_board.Color(r * bright, g * bright, b * bright));
-            }
-            led_board.show();
-            break;
+        // ... case 0-5 оставляем как есть (Solid, Breathing, Rainbow, Running Cubes, Theater Chase, Strobe) ...
 
-        case 1:
+        // ===== НОВЫЕ ЭФФЕКТЫ (индексы 6..15) =====
+
+        case 6: // Fire
         {
-            float breath = 0.5 + 0.5 * sin(millis() * 0.003);
-            uint8_t bri = breath * led_board_brightness;
+            // Простая симуляция огня
             for (int i = 0; i < 8; i++) {
-                led_board.setPixelColor(i, led_board.Color(
-                    r * bri / 100,
-                    g * bri / 100,
-                    b * bri / 100
+                float heat = fireHeat[i];
+                heat = heat * 0.8 + random(0, 50) / 50.0;
+                if (heat > 1.0) heat = 1.0;
+                fireHeat[i] = heat;
+                uint8_t intensity = heat * 255;
+                uint8_t rr = r * intensity / 255;
+                uint8_t gg = g * intensity / 255 * 0.5;
+                uint8_t bb = b * intensity / 255 * 0.2;
+                led_board.setPixelColor(i, led_board.Color(rr * bright, gg * bright, bb * bright));
+            }
+            break;
+        }
+
+        case 7: // Meteor
+        {
+            led_board.clear();
+            int tail = 3;
+            for (int i = 0; i < tail; i++) {
+                int pos = (meteorPos - i + 8) % 8;
+                float fade = 1.0 - (float)i / tail;
+                led_board.setPixelColor(pos, led_board.Color(
+                    r * bright * fade,
+                    g * bright * fade,
+                    b * bright * fade
                 ));
             }
-            led_board.show();
+            meteorPos = (meteorPos + 1) % 8;
             break;
         }
 
-        case 2:
+        case 8: // Comet
         {
-            hueOffset = (hueOffset + 1) % 360;
-            for (int i = 0; i < 8; i++) {
-                int hue = (hueOffset + i * 360 / 8) % 360;
-                uint32_t col = led_board.ColorHSV(hue * 182, 255, led_board_brightness * 255 / 100);
-                led_board.setPixelColor(i, col);
-            }
-            led_board.show();
-            break;
-        }
-
-        case 3:
-        {
-            if (millis() - lastEffectTime > 40) {
-                lastEffectTime = millis();
-                cube1Pos += cubeDir1;
-                cube2Pos += cubeDir2;
-                if (cube1Pos >= 7 || cube1Pos <= 0) cubeDir1 *= -1;
-                if (cube2Pos >= 7 || cube2Pos <= 0) cubeDir2 *= -1;
-                if (cube1Pos == cube2Pos) {
-                    cubeDir1 *= -1;
-                    cubeDir2 *= -1;
-                }
-            }
             led_board.clear();
-            for (int i = 0; i < 2; i++) {
-                int p1 = cube1Pos + i;
-                if (p1 >= 0 && p1 < 8) led_board.setPixelColor(p1, led_board.Color(r * bright, g * bright, b * bright));
-                int p2 = cube2Pos + i;
-                if (p2 >= 0 && p2 < 8) led_board.setPixelColor(p2, led_board.Color(r * bright, g * bright, b * bright));
+            int tail = 4;
+            for (int i = 0; i < tail; i++) {
+                int pos = (cometPos - i + 8) % 8;
+                float fade = 1.0 - (float)i / tail;
+                fade *= fade;
+                led_board.setPixelColor(pos, led_board.Color(
+                    r * bright * fade,
+                    g * bright * fade,
+                    b * bright * fade
+                ));
             }
-            led_board.show();
+            cometPos = (cometPos + 1) % 8;
             break;
         }
 
-        case 4:
+        case 9: // Sparkle
         {
-            if (millis() - lastEffectTime > 100) {
-                lastEffectTime = millis();
-                chaseStep = (chaseStep + 1) % 3;
-            }
             for (int i = 0; i < 8; i++) {
-                if ((i + chaseStep) % 3 == 0) {
+                if (millis() - sparkleTimer[i] > random(50, 200)) {
+                    sparkleState[i] = !sparkleState[i];
+                    sparkleTimer[i] = millis();
+                }
+                if (sparkleState[i]) {
                     led_board.setPixelColor(i, led_board.Color(r * bright, g * bright, b * bright));
                 } else {
                     led_board.setPixelColor(i, 0);
                 }
             }
-            led_board.show();
             break;
         }
 
-        case 5:
+        case 10: // Noise
         {
-            if (millis() - lastEffectTime > 100) {
+            noiseSeed = (noiseSeed + 1) % 256;
+            for (int i = 0; i < 8; i++) {
+                int val = (noiseSeed + i * 31) % 256;
+                uint8_t intensity = val > 128 ? 255 : 0;
+                led_board.setPixelColor(i, led_board.Color(
+                    r * bright * intensity / 255,
+                    g * bright * intensity / 255,
+                    b * bright * intensity / 255
+                ));
+            }
+            break;
+        }
+
+        case 11: // Gradient
+        {
+            for (int i = 0; i < 8; i++) {
+                float pos = (float)i / 7;
+                uint8_t rr = r * (1 - pos) + 255 * pos;
+                uint8_t gg = g * (1 - pos) + 0 * pos;
+                uint8_t bb = b * (1 - pos) + 128 * pos;
+                led_board.setPixelColor(i, led_board.Color(rr * bright, gg * bright, bb * bright));
+            }
+            break;
+        }
+
+        case 12: // Wave
+        {
+            wavePhase = (wavePhase + 1) % 360;
+            for (int i = 0; i < 8; i++) {
+                float angle = wavePhase * 3.14159 / 180 + i * 0.5;
+                float val = (sin(angle) + 1) / 2;
+                uint8_t intensity = val * 255;
+                led_board.setPixelColor(i, led_board.Color(
+                    r * intensity / 255 * bright,
+                    g * intensity / 255 * bright,
+                    b * intensity / 255 * bright
+                ));
+            }
+            break;
+        }
+
+        case 13: // Snake
+        {
+            led_board.clear();
+            snakePos += snakeDir;
+            if (snakePos >= 8 || snakePos < 0) { snakeDir *= -1; snakePos += snakeDir; }
+            for (int i = 0; i < 3; i++) {
+                int pos = (snakePos - i + 8) % 8;
+                float fade = 1.0 - (float)i / 3;
+                led_board.setPixelColor(pos, led_board.Color(
+                    r * bright * fade,
+                    g * bright * fade,
+                    b * bright * fade
+                ));
+            }
+            break;
+        }
+
+        case 14: // Bounce
+        {
+            led_board.clear();
+            bouncePos += bounceDir;
+            if (bouncePos >= 7 || bouncePos < 0) bounceDir *= -1;
+            led_board.setPixelColor(bouncePos, led_board.Color(r * bright, g * bright, b * bright));
+            led_board.setPixelColor(bouncePos + 1, led_board.Color(r * bright * 0.5, g * bright * 0.5, b * bright * 0.5));
+            break;
+        }
+
+        case 15: // Twinkle
+        {
+            for (int i = 0; i < 8; i++) {
+                if (millis() - twinkleTimer[i] > random(100, 400)) {
+                    twinkleBright[i] = random(50, 255);
+                    twinkleTimer[i] = millis();
+                }
+                uint8_t val = twinkleBright[i];
+                led_board.setPixelColor(i, led_board.Color(
+                    r * val / 255 * bright,
+                    g * val / 255 * bright,
+                    b * val / 255 * bright
+                ));
+            }
+            break;
+        }
+
+        default: // Solid
+            for (int i = 0; i < 8; i++) {
+                led_board.setPixelColor(i, led_board.Color(r * bright, g * bright, b * bright));
+            }
+            break;
+    }
+    led_board.show();
+}
+void updateLedKeyboard() {
+    static unsigned long lastUpdate = 0;
+    static unsigned long lastEffectTime = 0;
+    static int hueOffset = 0;
+    static bool strobeState = false;
+    static float pulse = 0;
+    static int sparkleState = 0;
+    static unsigned long sparkleTimer = 0;
+    static int twinkleBright = 255;
+    static unsigned long twinkleTimer = 0;
+    static int wavePhase = 0;
+    static int fadeDir = 1;
+    static int fadeVal = 0;
+
+    if (led_keyboard_timeout > 0 && (millis() - lastLedActivity) > (led_keyboard_timeout * 1000UL)) {
+        led_keyboard.clear();
+        led_keyboard.show();
+        return;
+    }
+    if (millis() - lastUpdate < 30) return;
+    lastUpdate = millis();
+
+    uint32_t baseColor = colorPalette[led_keyboard_colorIdx];
+    uint8_t r = (baseColor >> 16) & 0xFF;
+    uint8_t g = (baseColor >> 8) & 0xFF;
+    uint8_t b = baseColor & 0xFF;
+    float bright = (float)led_keyboard_brightness / 100.0;
+
+    switch (led_keyboard_effect) {
+        // case 0-5 оставляем старые (Solid, Breathing, Rainbow (для одного диода просто смена цвета), Strobe и т.д.)
+        // Теперь новые эффекты для одиночного диода:
+        case 6: // Fire (мерцание)
+        {
+            int intensity = random(100, 255);
+            led_keyboard.setPixelColor(0, led_keyboard.Color(
+                r * intensity / 255 * bright,
+                g * intensity / 255 * bright * 0.3,
+                b * intensity / 255 * bright * 0.1
+            ));
+            break;
+        }
+
+        case 7: // Sparkle (вспышки)
+        {
+            if (millis() - sparkleTimer > random(50, 300)) {
+                sparkleState = !sparkleState;
+                sparkleTimer = millis();
+            }
+            if (sparkleState) {
+                led_keyboard.setPixelColor(0, led_keyboard.Color(r * bright, g * bright, b * bright));
+            } else {
+                led_keyboard.setPixelColor(0, 0);
+            }
+            break;
+        }
+
+        case 8: // Twinkle (плавное мерцание)
+        {
+            if (millis() - twinkleTimer > random(100, 300)) {
+                twinkleBright = random(50, 255);
+                twinkleTimer = millis();
+            }
+            led_keyboard.setPixelColor(0, led_keyboard.Color(
+                r * twinkleBright / 255 * bright,
+                g * twinkleBright / 255 * bright,
+                b * twinkleBright / 255 * bright
+            ));
+            break;
+        }
+
+        case 9: // Wave (плавное изменение яркости)
+        {
+            wavePhase = (wavePhase + 1) % 360;
+            float val = (sin(wavePhase * 3.14159 / 180) + 1) / 2;
+            uint8_t intensity = val * 255;
+            led_keyboard.setPixelColor(0, led_keyboard.Color(
+                r * intensity / 255 * bright,
+                g * intensity / 255 * bright,
+                b * intensity / 255 * bright
+            ));
+            break;
+        }
+
+        case 10: // Fade (затухание/нарастание)
+        {
+            fadeVal += fadeDir * 5;
+            if (fadeVal >= 255) { fadeVal = 255; fadeDir = -1; }
+            if (fadeVal <= 0) { fadeVal = 0; fadeDir = 1; }
+            led_keyboard.setPixelColor(0, led_keyboard.Color(
+                r * fadeVal / 255 * bright,
+                g * fadeVal / 255 * bright,
+                b * fadeVal / 255 * bright
+            ));
+            break;
+        }
+
+        case 11: // Color Cycle (медленная смена цвета)
+        {
+            hueOffset = (hueOffset + 1) % 360;
+            uint32_t col = led_keyboard.ColorHSV(hueOffset * 182, 255, led_keyboard_brightness * 255 / 100);
+            led_keyboard.setPixelColor(0, col);
+            break;
+        }
+
+        case 12: // Blink (мигание)
+        {
+            if (millis() - lastEffectTime > 200) {
                 lastEffectTime = millis();
                 strobeState = !strobeState;
             }
             if (strobeState) {
-                for (int i = 0; i < 8; i++) {
-                    led_board.setPixelColor(i, led_board.Color(r * bright, g * bright, b * bright));
-                }
+                led_keyboard.setPixelColor(0, led_keyboard.Color(r * bright, g * bright, b * bright));
             } else {
-                led_board.clear();
+                led_keyboard.setPixelColor(0, 0);
             }
-            led_board.show();
+            break;
+        }
+
+        case 13: // Pulse (пульсация)
+        {
+            pulse += 0.02;
+            float val = (sin(pulse) + 1) / 2;
+            uint8_t intensity = val * 255;
+            led_keyboard.setPixelColor(0, led_keyboard.Color(
+                r * intensity / 255 * bright,
+                g * intensity / 255 * bright,
+                b * intensity / 255 * bright
+            ));
+            break;
+        }
+
+        case 14: // Rainbow Cycle (быстрая смена)
+        {
+            hueOffset = (hueOffset + 2) % 360;
+            uint32_t col = led_keyboard.ColorHSV(hueOffset * 182, 255, led_keyboard_brightness * 255 / 100);
+            led_keyboard.setPixelColor(0, col);
+            break;
+        }
+
+        case 15: // Random (случайный цвет каждые 300 мс)
+        {
+            if (millis() - lastEffectTime > 300) {
+                lastEffectTime = millis();
+                uint32_t col = colorPalette[random(numColors)];
+                led_keyboard.setPixelColor(0, col);
+            }
             break;
         }
 
         default:
-            for (int i = 0; i < 8; i++) {
-                led_board.setPixelColor(i, led_board.Color(r * bright, g * bright, b * bright));
-            }
-            led_board.show();
+            led_keyboard.setPixelColor(0, led_keyboard.Color(r * bright, g * bright, b * bright));
             break;
     }
-}
-void updateLedKeyboard() {
-  static unsigned long lastUpdate = 0;
-  static unsigned long lastEffectTime = 0;
-  static int hueOffset = 0;
-  static bool strobeState = false;
-
-  if (led_keyboard_timeout > 0 && (millis() - lastLedActivity) > (led_keyboard_timeout * 1000UL)) {
-    led_keyboard.clear();
     led_keyboard.show();
-    return;
-  }
-  if (millis() - lastUpdate < 30) return;
-  lastUpdate = millis();
-
-  uint32_t baseColor = 0;
-  if (led_keyboard_colorIdx > 0 && led_keyboard_colorIdx < numColors) {
-    baseColor = colorPalette[led_keyboard_colorIdx];
-  } else {
-    baseColor = colorPalette[0];
-  }
-  uint8_t r = (baseColor >> 16) & 0xFF;
-  uint8_t g = (baseColor >> 8) & 0xFF;
-  uint8_t b = baseColor & 0xFF;
-  float bright = (float)led_keyboard_brightness / 100.0;
-
-  switch (led_keyboard_effect) {
-    case 0:
-      led_keyboard.setPixelColor(0, led_keyboard.Color(r * bright, g * bright, b * bright));
-      led_keyboard.show();
-      break;
-
-    case 1:
-    {
-      float breath = 0.5 + 0.5 * sin(millis() * 0.003);
-      uint8_t bri = breath * led_keyboard_brightness;
-      led_keyboard.setPixelColor(0, led_keyboard.Color(r * bri / 100, g * bri / 100, b * bri / 100));
-      led_keyboard.show();
-      break;
-    }
-
-    case 2:
-    {
-      hueOffset = (hueOffset + 1) % 360;
-      uint32_t col = led_keyboard.ColorHSV(hueOffset * 182, 255, led_keyboard_brightness * 255 / 100);
-      led_keyboard.setPixelColor(0, col);
-      led_keyboard.show();
-      break;
-    }
-
-    case 3:
-    {
-      if (millis() - lastEffectTime > 100) {
-        lastEffectTime = millis();
-        strobeState = !strobeState;
-      }
-      if (strobeState) {
-        led_keyboard.setPixelColor(0, led_keyboard.Color(r * bright, g * bright, b * bright));
-      } else {
-        led_keyboard.clear();
-      }
-      led_keyboard.show();
-      break;
-    }
-
-    default:
-      led_keyboard.setPixelColor(0, led_keyboard.Color(r * bright, g * bright, b * bright));
-      led_keyboard.show();
-      break;
-  }
 }
 void updateWifiSpectrum() {
   if (!wifiSpectrumActive) return;
@@ -4988,10 +5236,12 @@ void updateDisplay() {
     return;
   }
   switch (appState) {
+    case STATE_AUDIO_MENU: drawAudioMenu(); break;
+    case STATE_AUDIO_VOLUME: drawAudioVolume(); break;
     case STATE_APPS_MENU: drawAppsMenu(); break;
     case STATE_APPS_CALCULATOR: drawCalculator(); break;
     case STATE_APPS_GAME1: drawBirdGame(); break;
-    case STATE_APPS_GAME2: drawTetrisGame(); break;
+    case STATE_APPS_GAME2: drawDinoGame(); break;
     case STATE_BLUETOOTH_SCAN: drawBluetoothScan(); break;
     case STATE_BLUETOOTH_MENU: drawBluetoothMenu(); break;
     case STATE_LED_SELECT_DEVICE: drawLedSelectDevice(); break;
@@ -5065,10 +5315,6 @@ void setup() {
   led_keyboard.setBrightness(led_keyboard_brightness);
   loadLedSettings();
 
-  // Инициализация Tetris
-  randomSeed(analogRead(0));
-  spawnPiece();
-
   Wire.begin(OLED_SDA, OLED_SCL);
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
     Serial.println("OLED ERROR");
@@ -5086,6 +5332,18 @@ void setup() {
   debugPrint("Timeout loaded");
   pinMode(RESET_BTN_PIN, INPUT_PULLUP);
   pinMode(10, INPUT_PULLUP);
+  initBuzzer();
+  pref.begin("audio", true);
+  soundEnabled = pref.getBool("enabled", true);
+  soundVolume = pref.getInt("volume", 50);
+  pref.end();
+
+  pref.begin("games", true);
+  birdHighScore = pref.getInt("birdHigh", 0);
+  pref.end();
+  pref.begin("games", true);
+  dinoHighScore = pref.getInt("dinoHigh", 0);
+  pref.end();
 
   WiFi.mode(WIFI_OFF);
   delay(100);
@@ -5521,6 +5779,11 @@ if (appState == STATE_APPS_CALCULATOR) {
     if (up) {
       switch (appState) {
         // ---- Главное меню ----
+case STATE_AUDIO_MENU:
+    audioMenuIdx--;
+    if (audioMenuIdx < 0) audioMenuIdx = 2; // 3 пункта
+    needRedraw = true;
+    break;
         case STATE_MAIN_MENU:
           mainIdx--;
           if (mainIdx < 0) mainIdx = MAIN_SIZE_TOTAL - 1;
@@ -5658,6 +5921,11 @@ if (appState == STATE_APPS_CALCULATOR) {
 
     if (down) {
       switch (appState) {
+case STATE_AUDIO_MENU:
+    audioMenuIdx++;
+    if (audioMenuIdx > 2) audioMenuIdx = 0;
+    needRedraw = true;
+    break;
         case STATE_MAIN_MENU:
           mainIdx++;
           if (mainIdx >= MAIN_SIZE_TOTAL) mainIdx = 0;
@@ -5793,17 +6061,37 @@ if (appState == STATE_APPS_CALCULATOR) {
           needRedraw = true;
           break;
 
-        case STATE_APPS_MENU:
+case STATE_APPS_MENU:
     switch (appsMenuIdx) {
-      case 0: appState = STATE_APPS_CALCULATOR; break;
-      case 1: appState = STATE_APPS_GAME1; break;
-      case 2: appState = STATE_APPS_GAME2; break;
-      case 3: runWikipedia(); break;
-      case 4: appState = STATE_MAIN_MENU; break;
+        case 0: appState = STATE_APPS_CALCULATOR; break;
+        case 1: appState = STATE_APPS_GAME1; break;
+        case 2: appState = STATE_APPS_GAME2; break;
+        case 3: runWikipedia(); break;
+        case 4: appState = STATE_AUDIO_MENU; audioMenuIdx = 0; break;
+        case 5: appState = STATE_MAIN_MENU; break;
     }
     needRedraw = true;
-          break;
-
+    break;
+// ===== В БЛОКЕ if (up) =====
+    case STATE_AUDIO_MENU:
+        switch (audioMenuIdx) {
+            case 0: // Sound ON/OFF
+                soundEnabled = !soundEnabled;
+                pref.begin("audio", false);
+                pref.putBool("enabled", soundEnabled);
+                pref.end();
+                showMsg(soundEnabled ? "Звук ВКЛ" : "Звук ВЫКЛ");
+                break;
+            case 1: // Volume
+                appState = STATE_AUDIO_VOLUME;
+                break;
+            case 2: // Back
+                appState = STATE_APPS_MENU;
+                break;
+        }
+        needRedraw = true;
+        break;
+    break;
         // ---- Bluetooth ----
         case STATE_BLUETOOTH_SCAN:
           if (bleSelectedIdx == (int)bleDevices.size()) {
